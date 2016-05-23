@@ -1907,7 +1907,11 @@ void ReplicatedPG::do_op(OpRequestRef& op)
       return;
     }
     dout(20) << __func__ << "find_object_context got error " << r << dendl;
-    osd->reply_op_error(op, r);
+    if (op->may_write()) {
+      record_write_error(op, r);
+    } else {
+      osd->reply_op_error(op, r);
+    }
     return;
   }
 
@@ -2079,7 +2083,11 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   if (r) {
     dout(20) << __func__ << " returned an error: " << r << dendl;
     close_op_ctx(ctx);
-    osd->reply_op_error(op, r);
+    if (op->may_write()) {
+      record_write_error(op, r);
+    } else {
+      osd->reply_op_error(op, r);
+    }
     return;
   }
 
@@ -2128,6 +2136,22 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   } else if (op->may_write() || op->may_cache()) {
     osd->logger->tinc(l_osd_op_w_prepare_lat, prepare_latency);
   }
+}
+
+void ReplicatedPG::record_write_error(OpRequestRef& op, int r)
+{
+  dout(20) << __func__ << " r=" << r << dendl;
+  assert(op->may_write());
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  ObjectContextRef obc;
+  OpContext *ctx = new OpContext(op, m->get_reqid(), m->ops, obc, this);
+  int flags = CEPH_OSD_FLAG_ACK|CEPH_OSD_FLAG_ONDISK;
+  ctx->reply = new MOSDOpReply(m, r, get_osdmap()->get_epoch(), flags, true);
+  ctx->reply->set_reply_versions(eversion_t(), 0);
+  ctx->update_log_only = true;
+
+  prepare_log_update(ctx, pg_log_entry_t::ERROR, r);
+  prepare_and_send_repop(ctx);
 }
 
 ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
@@ -2852,6 +2876,7 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
 {
   dout(10) << __func__ << " " << ctx << dendl;
   ctx->reset_obs(ctx->obc);
+  ctx->update_log_only = false; // reset in case finish_copyfrom() is re-running execute_ctx
   OpRequestRef op = ctx->op;
   MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   ObjectContextRef obc = ctx->obc;
@@ -2968,7 +2993,7 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
   ctx->reply->set_result(result);
 
   // read or error?
-  if (ctx->op_t->empty() || result < 0) {
+  if ((ctx->op_t->empty() || result < 0) && !ctx->update_log_only) {
     // finish side-effects
     if (result >= 0)
       do_osd_op_effects(ctx, m->get_connection());
@@ -3008,6 +3033,15 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
       }
       p->second = t;
     }
+  }
+
+  if (ctx->update_log_only) {
+    dout(20) << __func__ << " update_log_only -- result=" << result << dendl;
+    assert(result < 0);
+    // just append to pg log for dup detection
+    close_op_ctx(ctx);
+    record_write_error(op, result);
+    return;
   }
 
   // no need to capture PG ref, repop cancel will handle that
@@ -6601,8 +6635,14 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
 
   // prepare the actual mutation
   int result = do_osd_ops(ctx, ctx->ops);
-  if (result < 0)
+  if (result < 0) {
+    if (ctx->op->may_write()) {
+      // need to save the error code in the pg log, to detect dup ops,
+      // but do nothing else
+      ctx->update_log_only = true;
+    }
     return result;
+  }
 
   // read-op?  done?
   if (ctx->op_t->empty() && !ctx->modify) {
