@@ -2143,16 +2143,27 @@ void ReplicatedPG::record_write_error(OpRequestRef& op, int r)
 {
   dout(20) << __func__ << " r=" << r << dendl;
   assert(op->may_write());
-  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  const osd_reqid_t &reqid = static_cast<MOSDOp*>(op->get_req())->get_reqid();
   ObjectContextRef obc;
-  OpContext *ctx = new OpContext(op, m->get_reqid(), m->ops, obc, this);
-  int flags = CEPH_OSD_FLAG_ACK|CEPH_OSD_FLAG_ONDISK;
-  ctx->reply = new MOSDOpReply(m, r, get_osdmap()->get_epoch(), flags, true);
-  ctx->reply->set_reply_versions(eversion_t(), 0);
-  ctx->update_log_only = true;
-
-  prepare_log_update(ctx, pg_log_entry_t::ERROR, r);
-  prepare_and_send_repop(ctx);
+  list<pg_log_entry_t> entries;
+  entries.push_back(pg_log_entry_t(pg_log_entry_t::ERROR, hobject_t(),
+				   get_next_version(), eversion_t(), 0,
+				   reqid, utime_t(), r));
+  ObcLockManager lock_manager;
+  submit_log_entries(
+    entries,
+    std::move(lock_manager),
+    boost::optional<std::function<void(void)> >(
+      [=]() {
+	dout(20) << "finished record_write_error r=" << r << dendl;
+	int flags = CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
+	MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+	MOSDOpReply *reply = new MOSDOpReply(m, r, get_osdmap()->get_epoch(), flags, true);
+	reply->set_reply_versions(eversion_t(), 0);
+	dout(10) << " sending commit on " << *m << " " << reply << dendl;
+	osd->send_message_osd_client(reply, m->get_connection());
+      }
+      ));
 }
 
 ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
