@@ -1066,3 +1066,5 @@ OPTION(throttler_perf_counter, OPT_BOOL, true) // enable/disable throttler perf 
 // This will be set to true when it is safe to start threads.
 // Once it is true, it will never change.
 OPTION(internal_safe_to_start_threads, OPT_BOOL, false)
+OPTION(osd_trace_op_log, OPT_BOOL, false)
+OPTION(osd_trace_op_log_file, OPT_STR, "/var/log/ceph/$cluster-$name.$id-operation-trace.log")

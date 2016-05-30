@@ -40,6 +40,10 @@
 #include "ReplicatedBackend.h"
 #include "ECBackend.h"
 
+#include <fstream>
+#include <sstream>
+#include <iostream>
+
 class MOSDSubOpReply;
 
 class CopyFromCallback;
@@ -93,6 +97,9 @@ public:
 class ReplicatedPG : public PG, public PGBackend::Listener {
   friend class OSD;
   friend class Watch;
+
+private:
+  static std::ofstream op_tracer;
 
 public:
 
