@@ -2421,6 +2421,7 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
   }
   else if(op_tracer.is_open()){
 	  op_tracer.close();
+  }
 
   repop->put();
 }
