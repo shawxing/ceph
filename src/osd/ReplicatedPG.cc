@@ -1751,7 +1751,60 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   op->mark_started();
   ctx->src_obc = src_obc;
 
+  utime_t op_start_time = ceph_clock_now(NULL);
+
   execute_ctx(ctx);
+
+  if(cct->_conf->osd_trace_op_log){
+	  string op_name = "";
+	  vector<OSDOp> &ops = ctx->ops;
+	  for (vector<OSDOp>::iterator p = ops.begin(); p != ops.end(); ++p) {
+	    OSDOp& osd_op = *p;
+	    ceph_osd_op& op = osd_op.op;
+
+	    switch (op.op){
+	      case CEPH_OSD_OP_READ:
+	        op_name.append(" read ");
+	            break;
+	      case CEPH_OSD_OP_WRITE:
+	        op_name.append(" write ");
+	            break;
+	      case CEPH_OSD_OP_ZERO:
+	        op_name.append(" zero ");
+	            break;
+	      case CEPH_OSD_OP_WRITEFULL:
+	        op_name.append(" writefull ");
+	            break;
+	      case CEPH_OSD_OP_TRUNCATE:
+	        op_name.append(" truncate ");
+	            break;
+	      case CEPH_OSD_OP_STAT:
+	        op_name.append(" stat ");
+	            break;
+	      case CEPH_OSD_OP_DELETE:
+	        op_name.append(" delete ");
+	            break;
+	    }
+	  }
+
+      if(!op_name.empty()){
+  #define TIME_FORMAT_LEN 30
+      utime_t currenttime = ceph_clock_now(NULL);
+      utime_t op_time = currenttime - op_start_time;
+      char strcurrent[TIME_FORMAT_LEN];
+      currenttime.sprintf(strcurrent,TIME_FORMAT_LEN);
+      if(!op_tracer.is_open())
+    	  op_tracer.open(cct->_conf->osd_trace_op_log_file.c_str(),std::ios::app);
+
+      const hobject_t& soid = obc->obs.oi.soid;
+      op_tracer.fill('0');
+      op_tracer << strcurrent << "," << op_name.c_str() << ","<<soid.oid.name.c_str() << ","
+          << (long)op_time.sec() << "." << std::setw(6) << (long)op_time.usec() <<std::endl;
+      }
+  }
+  else if(op_tracer.is_open()){
+	  op_tracer.close();
+  }
 }
 
 bool ReplicatedPG::maybe_handle_cache(OpRequestRef op,
@@ -2368,60 +2421,10 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
   // note: repop now owns ctx AND ctx->op
 
   repop->src_obc.swap(src_obc); // and src_obc.
-  utime_t op_start_time = ceph_clock_now(NULL);
 
   issue_repop(repop);
 
   eval_repop(repop);
-
-  if(cct->_conf->osd_trace_op_log){
-	string op_name = "";
-    vector<OSDOp> &ops = ctx->ops;
-    for (vector<OSDOp>::iterator p = ops.begin(); p != ops.end(); ++p) {
-      OSDOp& osd_op = *p;
-      ceph_osd_op& op = osd_op.op;
-      switch (op.op){
-        case CEPH_OSD_OP_READ:
-          op_name.append(" read ");
-              break;
-        case CEPH_OSD_OP_WRITE:
-          op_name.append(" write ");
-              break;
-        case CEPH_OSD_OP_ZERO:
-          op_name.append(" zero ");
-              break;
-        case CEPH_OSD_OP_WRITEFULL:
-          op_name.append(" writefull ");
-              break;
-        case CEPH_OSD_OP_TRUNCATE:
-          op_name.append(" truncate ");
-              break;
-        case CEPH_OSD_OP_STAT:
-          op_name.append(" stat ");
-              break;
-        case CEPH_OSD_OP_DELETE:
-          op_name.append(" delete ");
-              break;
-      }
-    }
-
-      if(!op_name.empty()){
-  #define TIME_FORMAT_LEN 30
-      utime_t currenttime = ceph_clock_now(NULL);
-      utime_t op_time = currenttime - op_start_time;
-      char strcurrent[TIME_FORMAT_LEN];
-      currenttime.sprintf(strcurrent,TIME_FORMAT_LEN);
-      if(!op_tracer.is_open())
-    	  op_tracer.open(cct->_conf->osd_trace_op_log_file.c_str(),std::ios::app);
-
-      op_tracer.fill('0');
-      op_tracer << strcurrent << "," << op_name.c_str() << ","<<soid.oid.name.c_str() << ","//<<soid.snap.val<<","
-          << (long)op_time.sec() << "." << std::setw(6) << (long)op_time.usec() <<std::endl;
-      }
-  }
-  else if(op_tracer.is_open()){
-	  op_tracer.close();
-  }
 
   repop->put();
 }
