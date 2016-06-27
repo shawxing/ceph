@@ -1262,7 +1262,7 @@ void RGWRESTMgr::register_resource(string resource, RGWRESTMgr *mgr)
   /* do we have a resource manager registered for this entry point? */
   map<string, RGWRESTMgr *>::iterator iter = resource_mgrs.find(r);
   if (iter != resource_mgrs.end()) {
-    delete iter->second;
+    delete iter->second;//已经注册过相同名字的，销毁掉旧的
   }
   resource_mgrs[r] = mgr;
   resources_by_size.insert(pair<size_t, string>(r.size(), r));
@@ -1302,6 +1302,7 @@ RGWRESTMgr *RGWRESTMgr::get_resource_mgr(struct req_state *s, const string& uri,
 
   multimap<size_t, string>::reverse_iterator iter;
 
+//  根据uri获取处理类
   for (iter = resources_by_size.rbegin(); iter != resources_by_size.rend(); ++iter) {
     string& resource = iter->second;
     if (uri.compare(0, iter->first, resource) == 0 &&
@@ -1312,6 +1313,7 @@ RGWRESTMgr *RGWRESTMgr::get_resource_mgr(struct req_state *s, const string& uri,
     }
   }
 
+//  没有就返回默认处理s3
   if (default_mgr)
     return default_mgr;
 
@@ -1391,6 +1393,7 @@ int RGWREST::preprocess(struct req_state *s, RGWClientIO *cio)
     s->info.domain = s->cct->_conf->rgw_dns_name;
   }
 
+//  把request_uri decode到decoded_uri
   url_decode(s->info.request_uri, s->decoded_uri);
 
   /* FastCGI specification, section 6.3
@@ -1487,11 +1490,12 @@ RGWHandler *RGWREST::get_handler(RGWRados *store, struct req_state *s, RGWClient
 				 RGWRESTMgr **pmgr, int *init_error)
 {
   RGWHandler *handler;
-
+//预处理http头部信息
   *init_error = preprocess(s, cio);
   if (*init_error < 0)
     return NULL;
 
+//  根据uri获取RGWRESTMgr的子类
   RGWRESTMgr *m = mgr.get_resource_mgr(s, s->decoded_uri, &s->relative_uri);
   if (!m) {
     *init_error = -ERR_METHOD_NOT_ALLOWED;
@@ -1500,15 +1504,15 @@ RGWHandler *RGWREST::get_handler(RGWRados *store, struct req_state *s, RGWClient
 
   if (pmgr)
     *pmgr = m;
-
+// 根据RGWRESTMgr的子类获取RGWHandler，若是s3,则RGWHandler_ObjStore_Service_S3/RGWHandler_ObjStore_Bucket_S3/RGWHandler_ObjStore_Obj_S3
   handler = m->get_handler(s);
   if (!handler) {
     *init_error = -ERR_METHOD_NOT_ALLOWED;
     return NULL;
   }
-  *init_error = handler->init(store, s, cio);
+  *init_error = handler->init(store, s, cio);//handler初始化，若是s3，则调用RGWHandler_ObjStore_S3::init
   if (*init_error < 0) {
-    m->put_handler(handler);
+    m->put_handler(handler);//delete handler point
     return NULL;
   }
 

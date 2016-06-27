@@ -204,10 +204,13 @@ struct user_info_entry {
 
 static RGWChainedCacheImpl<user_info_entry> uinfo_cache;
 
+//key可以是email，swift name，access key
 int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucket, RGWUserInfo& info,
                                  RGWObjVersionTracker *objv_tracker, time_t *pmtime)
 {
   user_info_entry e;
+  // 使用key 从 uinfo_cache (chain cache) 中检索 user info
+  // 如果找到了，就返回其值
   if (uinfo_cache.find(key, &e)) {
     info = e.info;
     if (objv_tracker)
@@ -217,11 +220,17 @@ int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucke
     return 0;
   }
 
+  // 如果在 chain cache 中没有找到 user info，那么就
+    // 从后端ceph 集群读取user info 对象的内容来获取user info
   bufferlist bl;
   RGWUID uid;
   RGWObjectCtx obj_ctx(store);
 
-  int ret = rgw_get_system_obj(store, obj_ctx, bucket, key, bl, NULL, &e.mtime);
+  // rgw_get_system_obj ->
+  // RGWRados::SystemObject::Read::read ->
+  // RGWCache<RGWRados>::get_system_obj ->
+  // ObjectCache::get // 这里首先会从ObjectCache中读取user info
+  int ret = rgw_get_system_obj(store, obj_ctx, bucket, key, bl, NULL, &e.mtime);//通过accesskey获取到了userid
   if (ret < 0)
     return ret;
 
@@ -230,7 +239,7 @@ int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucke
   bufferlist::iterator iter = bl.begin();
   try {
     ::decode(uid, iter);
-    int ret = rgw_get_user_info_by_uid(store, uid.user_id, e.info, &e.objv_tracker, NULL, &cache_info);
+    int ret = rgw_get_user_info_by_uid(store, uid.user_id, e.info, &e.objv_tracker, NULL, &cache_info);//根据上面获取到的userid获取userinfo
     if (ret < 0) {
       return ret;
     }
@@ -239,6 +248,7 @@ int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucke
     return -EIO;
   }
 
+//  更新cache
   list<rgw_cache_entry_info *> cache_info_entries;
   cache_info_entries.push_back(&cache_info);
 
@@ -2517,6 +2527,7 @@ public:
 
 void rgw_user_init(RGWRados *store)
 {
+//	uinfo_cache初始化。将chainedcache注册到objectcache（rgwcache）
   uinfo_cache.init(store);
 
   user_meta_handler = new RGWUserMetadataHandler;

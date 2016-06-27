@@ -2104,7 +2104,7 @@ int RGWHandler_ObjStore_S3::init_from_header(struct req_state *s, int default_fo
   } else {
     p = s->info.request_params.c_str();
   }
-
+//解析？号后面参数
   s->info.args.set(p);
   s->info.args.parse();
 
@@ -2120,7 +2120,7 @@ int RGWHandler_ObjStore_S3::init_from_header(struct req_state *s, int default_fo
 
   if (!*req_name)
     return 0;
-
+//解析bucket name
   req = req_name;
   int pos = req.find('/');
   if (pos >= 0) {
@@ -2134,7 +2134,7 @@ int RGWHandler_ObjStore_S3::init_from_header(struct req_state *s, int default_fo
 
     if (pos >= 0) {
       string encoded_obj_str = req.substr(pos+1);
-      s->object = rgw_obj_key(encoded_obj_str, s->info.args.get("versionId"));
+      s->object = rgw_obj_key(encoded_obj_str, s->info.args.get("versionId"));//构造object key
     }
   } else {
     s->object = rgw_obj_key(req_name, s->info.args.get("versionId"));
@@ -2205,13 +2205,13 @@ int RGWHandler_ObjStore_S3::init(RGWRados *store, struct req_state *s, RGWClient
   dout(10) << "s->object=" << (!s->object.empty() ? s->object : rgw_obj_key("<NULL>")) << " s->bucket=" << (!s->bucket_name_str.empty() ? s->bucket_name_str : "<NULL>") << dendl;
 
   bool relaxed_names = s->cct->_conf->rgw_relaxed_s3_bucket_names;
-  int ret = validate_bucket_name(s->bucket_name_str, relaxed_names);
+  int ret = validate_bucket_name(s->bucket_name_str, relaxed_names);//验证bucket name是否何规范
   if (ret)
     return ret;
-  ret = validate_object_name(s->object.name);
+  ret = validate_object_name(s->object.name);//验证object是否合规范
   if (ret)
     return ret;
-
+//解析一些s3的http头
   const char *cacl = s->info.env->get("HTTP_X_AMZ_ACL");
   if (cacl)
     s->canned_acl = cacl;
@@ -2227,9 +2227,9 @@ int RGWHandler_ObjStore_S3::init(RGWRados *store, struct req_state *s, RGWClient
     }
   }
 
-  s->dialect = "s3";
+  s->dialect = "s3";//方言s3
 
-  return RGWHandler_ObjStore::init(store, s, cio);
+  return RGWHandler_ObjStore::init(store, s, cio);//父类init
 }
 
 
@@ -2354,11 +2354,12 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
     if (pos < 0)
       return -EINVAL;
 
-    auth_id = auth_str.substr(0, pos);
-    auth_sign = auth_str.substr(pos + 1);
+    auth_id = auth_str.substr(0, pos);//access key
+    auth_sign = auth_str.substr(pos + 1);//签名
   }
 
   /* try keystone auth first */
+//  s3一般不适用keystone，跳过不看
   int keystone_result = -EINVAL;
   if (store->ctx()->_conf->rgw_s3_auth_use_keystone
       && !store->ctx()->_conf->rgw_keystone_url.empty()) {
@@ -2405,7 +2406,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
 
   /* now try rados backend, but only if keystone did not succeed */
   if (keystone_result < 0) {
-    /* get the user info */
+    /* get the user info *///通过accessid获取userinfo
     if (rgw_get_user_info_by_access_key(store, auth_id, s->user) < 0) {
       dout(5) << "error reading user info, uid=" << auth_id << " can't authenticate" << dendl;
       return -ERR_INVALID_ACCESS_KEY;
@@ -2413,7 +2414,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
 
     /* now verify signature */
 
-    string auth_hdr;
+    string auth_hdr;//获取StringToSign：各种需要的头拼一起
     if (!rgw_create_s3_canonical_header(s->info, &s->header_time, auth_hdr, qsr)) {
       dout(10) << "failed to create auth header\n" << auth_hdr << dendl;
       return -EPERM;
@@ -2428,7 +2429,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
       return -ERR_REQUEST_TIME_SKEWED;
     }
 
-    map<string, RGWAccessKey>::iterator iter = s->user.access_keys.find(auth_id);
+    map<string, RGWAccessKey>::iterator iter = s->user.access_keys.find(auth_id);//找到对应access key的secret key
     if (iter == s->user.access_keys.end()) {
       dout(0) << "ERROR: access key not encoded in user info" << dendl;
       return -EPERM;
@@ -2444,10 +2445,10 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
       RGWSubUser& subuser = uiter->second;
       s->perm_mask = subuser.perm_mask;
     } else
-      s->perm_mask = RGW_PERM_FULL_CONTROL;
+      s->perm_mask = RGW_PERM_FULL_CONTROL;//获取perm_mask
 
     string digest;
-    int ret = rgw_get_s3_header_digest(auth_hdr, k.key, digest);
+    int ret = rgw_get_s3_header_digest(auth_hdr, k.key, digest);//计算签名
     if (ret < 0) {
       return -EPERM;
     }
@@ -2460,6 +2461,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
       return -ERR_SIGNATURE_NO_MATCH;
     }
 
+    //系统用户？？
     if (s->user.system) {
       s->system_request = true;
       dout(20) << "system request" << dendl;
@@ -2478,7 +2480,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
 
   } /* if keystone_result < 0 */
 
-  // populate the owner info
+  // populate the owner info更改owner信息
   s->owner.set_id(s->user.user_id);
   s->owner.set_name(s->user.display_name);
 
@@ -2497,6 +2499,7 @@ int RGWHandler_Auth_S3::init(RGWRados *store, struct req_state *state, RGWClient
 
 RGWHandler *RGWRESTMgr_S3::get_handler(struct req_state *s)
 {
+//	调用静态方法解析出uri中的bucketname，object给s，初始化s中的Formatter
   int ret = RGWHandler_ObjStore_S3::init_from_header(s, RGW_FORMAT_XML, false);
   if (ret < 0)
     return NULL;

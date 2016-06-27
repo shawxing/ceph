@@ -137,12 +137,14 @@ struct ObjectCacheEntry {
   ObjectCacheEntry() : lru_promotion_ts(0), gen(0) {}
 };
 
+//为了辅助cache_map维护一个lru逻辑，增加了lru list以及其他相关字段，确保最新
+//被访问的entry放在cache_map中。
 class ObjectCache {
   std::map<string, ObjectCacheEntry> cache_map;
-  std::list<string> lru;
-  unsigned long lru_size;
-  unsigned long lru_counter;
-  unsigned long lru_window;
+  std::list<string> lru;// cache_map中key的lru列表
+  unsigned long lru_size;// lru list的entry个数
+  unsigned long lru_counter;// touch_lru调用计数器
+  unsigned long lru_window;// 1/2*(rgw cache lru size)
   RWLock lock;
   CephContext *cct;
 
@@ -199,7 +201,10 @@ class RGWCache  : public T
 
   int init_rados() {
     int ret;
+    // 初始化用于和后端ceph集群交互的CephContext，并根据配置文件中
+    // 'rgw cache lru size' 设置 ObjectCache::lru_window的值。
     cache.set_ctx(T::cct);
+    // 初始化到ceph集群的rados handle，并准备RGWMetadataManager和RGWDataChangesLog
     ret = T::init_rados();
     if (ret < 0)
       return ret;

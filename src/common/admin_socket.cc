@@ -251,7 +251,7 @@ std::string AdminSocket::bind_and_listen(const std::string &sock_path, int *fd)
   *fd = sock_fd;
   return "";
 }
-
+//线程入口，监听listen事件，有客户端进来就do_accept开干了
 void* AdminSocket::entry()
 {
   ldout(m_cct, 5) << "entry start" << dendl;
@@ -518,7 +518,7 @@ public:
     return true;
   }
 };
-
+// 绑定socket和listen
 bool AdminSocket::init(const std::string &path)
 {
   ldout(m_cct, 5) << "init " << path << dendl;

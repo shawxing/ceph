@@ -1831,15 +1831,17 @@ int RGWRados::open_bucket_pool_ctx(const string& bucket_name, const string& pool
   librados::Rados *rad = get_rados_handle();
   int r = rad->ioctx_create(pool.c_str(), io_ctx);
   if (r != -ENOENT)
-    return r;
+    return r;//存在，返回
 
   if (!pools_initialized)
     return r;
 
+	//不存在，创建pool
   r = rad->pool_create(pool.c_str());
   if (r < 0 && r != -EEXIST)
     return r;
 
+	//再创建ioctx
   r = rad->ioctx_create(pool.c_str(), io_ctx);
 
   return r;
@@ -4922,7 +4924,7 @@ int RGWRados::get_obj_state_impl(RGWObjectCtx *rctx, rgw_obj& obj, RGWObjState *
   }
 
   s->obj = obj;
-
+//获取对象的stat，size，mtime，epoch，attr等
   int r = raw_obj_stat(obj, &s->size, &s->mtime, &s->epoch, &s->attrset, (s->prefetch_data ? &s->data : NULL), objv_tracker);
   if (r == -ENOENT) {
     s->exists = false;
@@ -5013,12 +5015,13 @@ int RGWRados::get_obj_state(RGWObjectCtx *rctx, rgw_obj& obj, RGWObjState **stat
 int RGWRados::Object::Read::get_attr(const char *name, bufferlist& dest)
 {
   RGWObjState *state;
+  //获取RGWObjState
   int r = source->get_state(&state, true);
   if (r < 0)
     return r;
   if (!state->exists)
     return -ENOENT;
-  if (!state->get_attr(name, dest))
+  if (!state->get_attr(name, dest))//从RGWObjState获取attr
     return -ENODATA;
 
   return 0;
@@ -7057,7 +7060,7 @@ int RGWRados::raw_obj_stat(rgw_obj& obj, uint64_t *psize, time_t *pmtime, uint64
     op.read(0, cct->_conf->rgw_max_chunk_size, first_chunk, NULL);
   }
   bufferlist outbl;
-  r = ref.ioctx.operate(ref.oid, &op, &outbl);
+  r = ref.ioctx.operate(ref.oid, &op, &outbl);//执行操作
 
   if (epoch) {
     *epoch = ref.ioctx.get_last_version();
@@ -7071,7 +7074,7 @@ int RGWRados::raw_obj_stat(rgw_obj& obj, uint64_t *psize, time_t *pmtime, uint64
   if (pmtime)
     *pmtime = mtime;
   if (attrs) {
-    filter_attrset(unfiltered_attrset, RGW_ATTR_PREFIX, attrs);
+    filter_attrset(unfiltered_attrset, RGW_ATTR_PREFIX, attrs);//加前缀
   }
 
   return 0;
@@ -7372,12 +7375,14 @@ int RGWRados::get_bucket_info(RGWObjectCtx& obj_ctx, const string& bucket_name, 
   time_t ep_mtime;
   RGWObjVersionTracker ot;
   rgw_cache_entry_info entry_cache_info;
+  //从pool .rgw 中获取bucketname对象的内容，即RGWBucketEntryPoint
   int ret = get_bucket_entrypoint_info(obj_ctx, bucket_name, entry_point, &ot, &ep_mtime, pattrs, &entry_cache_info);
   if (ret < 0) {
     info.bucket.name = bucket_name; /* only init this field */
     return ret;
   }
 
+  //旧版本RGWBucketEntryPoint身就保存着RGWBucketInfo，直接返回
   if (entry_point.has_bucket_info) {
     info = entry_point.old_bucket_info;
     info.bucket.oid = bucket_name;
@@ -7401,10 +7406,10 @@ int RGWRados::get_bucket_info(RGWObjectCtx& obj_ctx, const string& bucket_name, 
   /* read bucket instance info */
 
   string oid;
-  get_bucket_meta_oid(entry_point.bucket, oid);
+  get_bucket_meta_oid(entry_point.bucket, oid);//根据bucketname和bucketid组合类似.bucket.meta.tb1:default.4128.1字符串，即bucket元数据对象名称
 
   rgw_cache_entry_info cache_info;
-
+//从.rgw 中 bucket元数据对象 获取RGWBucketInfo
   ret = get_bucket_instance_from_oid(obj_ctx, oid, e.info, &e.mtime, &e.attrs, &cache_info);
   e.info.ep_objv = ot.read_version;
   info = e.info;

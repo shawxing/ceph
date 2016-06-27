@@ -35,6 +35,7 @@ public:
   virtual ~AdminSocketHook() {}
 };
 
+//提供了供外部ceph daemon调用的接口，如执行命令：ceph deamon osd.0 config show。用进程间通信unix socket来完成命令的接收。
 class AdminSocket : public Thread
 {
 public:

@@ -538,23 +538,24 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
 {
   int ret = 0;
 
+//  要是从civetweb传过来，重复调用了init
   client_io->init(g_ceph_context);
-
+// 初始化日志开始时间，为了计算后面操作的时间？？
   req->log_init();
 
   dout(1) << "====== starting new request req=" << hex << req << dec << " =====" << dendl;
-  perfcounter->inc(l_rgw_req);
+  perfcounter->inc(l_rgw_req);//更新性能计数器，累加请求一次。
 
-  RGWEnv& rgw_env = client_io->get_env();
-
+  RGWEnv& rgw_env = client_io->get_env();//获取RGWEnv，为了req_state的初始化获取RGWConf的一些配置变量
+//req_state，保罗万象地保存很多状态信息
   struct req_state rstate(g_ceph_context, &rgw_env);
 
   struct req_state *s = &rstate;
-
+//对象上下文
   RGWObjectCtx rados_ctx(store, s);
   s->obj_ctx = &rados_ctx;
 
-  s->req_id = store->unique_id(req->id);
+  s->req_id = store->unique_id(req->id);//zone.name+"."+reqid
   s->trans_id = store->unique_trans_id(req->id);
 
   req->log_format(s, "initializing for trans_id = %s", s->trans_id.c_str());
@@ -563,6 +564,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   int init_error = 0;
   bool should_log = false;
   RGWRESTMgr *mgr;
+//  获取RGWRESTMgr和handler
   RGWHandler *handler = rest->get_handler(store, s, client_io, &mgr, &init_error);
   if (init_error != 0) {
     abort_early(s, NULL, init_error);
@@ -572,7 +574,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   should_log = mgr->get_logging();
 
   req->log(s, "getting op");
-  op = handler->get_op(store);
+  op = handler->get_op(store);//根据s->op操作获取rgwop
   if (!op) {
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED);
     goto done;
@@ -580,41 +582,41 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   req->op = op;
 
   req->log(s, "authorizing");
-  ret = handler->authorize();
+  ret = handler->authorize();//若s3，调用RGW_Auth_S3::authorize验证
   if (ret < 0) {
     dout(10) << "failed to authorize request" << dendl;
     abort_early(s, op, ret);
     goto done;
   }
 
-  if (s->user.suspended) {
+  if (s->user.suspended) {//userinfo 在authorize的时候获取到了
     dout(10) << "user is suspended, uid=" << s->user.user_id << dendl;
     abort_early(s, op, -ERR_USER_SUSPENDED);
     goto done;
   }
   req->log(s, "reading permissions");
-  ret = handler->read_permissions(op);
+  ret = handler->read_permissions(op);//读取bucket或者object的acl，保存到s
   if (ret < 0) {
     abort_early(s, op, ret);
     goto done;
   }
 
   req->log(s, "init op");
-  ret = op->init_processing();
+  ret = op->init_processing();//主要是初始化op的quota
   if (ret < 0) {
     abort_early(s, op, ret);
     goto done;
   }
 
   req->log(s, "verifying op mask");
-  ret = op->verify_op_mask();
+  ret = op->verify_op_mask();//验证用户是否可以进行此操作，因为每个操作都定义有权限（RGW_OP_TYPE_READ）等，这些都是用户创建的时候保存在RGWUserInfo的op_mask中
   if (ret < 0) {
     abort_early(s, op, ret);
     goto done;
   }
 
   req->log(s, "verifying op permissions");
-  ret = op->verify_permission();
+  ret = op->verify_permission();//验证acl权限
   if (ret < 0) {
     if (s->system_request) {
       dout(2) << "overriding permissions due to system operation" << dendl;
@@ -625,14 +627,14 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   }
 
   req->log(s, "verifying op params");
-  ret = op->verify_params();
+  ret = op->verify_params();//检验参数，主要是检验len参数是否大于最大值
   if (ret < 0) {
     abort_early(s, op, ret);
     goto done;
   }
 
   req->log(s, "executing");
-  op->pre_exec();
+  op->pre_exec();//do nothing or send_100_continue
   op->execute();
   op->complete();
 done:
@@ -714,9 +716,11 @@ static int civetweb_callback(struct mg_connection *conn) {
   RGWREST *rest = pe->rest;
   OpsLogSocket *olog = pe->olog;
 
+  //new一个RGWRequest，等会看看是什么来的
   RGWRequest *req = new RGWRequest(store->get_new_req_id());
+//  RGWMongoose类，http处理的操作都在这里了，接收解析头部，封装发送状态码
   RGWMongoose client_io(conn, pe->port);
-
+//  从conn里获取http头，保存至RGWEnv;RGWConf的一些配置变量用g_ceph_context里的配置初始化，
   client_io.init(g_ceph_context);
 
 
@@ -775,7 +779,7 @@ static RGWRESTMgr *set_logging(RGWRESTMgr *mgr)
   return mgr;
 }
 
-
+//解析配置：如civetweb port=7480被解析，framework=civetweb ,config_map["port"]=7480
 int RGWFrontendConfig::parse_config(const string& config, map<string, string>& config_map)
 {
   list<string> config_list;
@@ -967,16 +971,17 @@ public:
 
   int run() {
     char thread_pool_buf[32];
-    snprintf(thread_pool_buf, sizeof(thread_pool_buf), "%d", (int)g_conf->rgw_thread_pool_size);
+    snprintf(thread_pool_buf, sizeof(thread_pool_buf), "%d", (int)g_conf->rgw_thread_pool_size);//civetweb线程池大小，默认100
     string port_str;
     map<string, string> conf_map = conf->get_config_map();
-    conf->get_val("port", "80", &port_str);
+    conf->get_val("port", "80", &port_str);//解析出端口号
     conf_map.erase("port");
     conf_map["listening_ports"] = port_str;
-    set_conf_default(conf_map, "enable_keep_alive", "yes");
+    set_conf_default(conf_map, "enable_keep_alive", "yes");//添加一些civetweb需要的配置项
     set_conf_default(conf_map, "num_threads", thread_pool_buf);
     set_conf_default(conf_map, "decode_url", "no");
 
+    //将配置项变成一维数组，mg_start需要
     const char *options[conf_map.size() * 2 + 1];
     int i = 0;
     for (map<string, string>::iterator iter = conf_map.begin(); iter != conf_map.end(); ++iter) {
@@ -1032,12 +1037,15 @@ int main(int argc, const char **argv)
   def_args.push_back("--keyring=$rgw_data/keyring");
   def_args.push_back("--log-file=/var/log/radosgw/$cluster-$name.log");
 
+//把argv和环境变量的配置保存到向量args
   vector<const char*> args;
   argv_to_vec(argc, argv, args);
   env_to_vec(args);
+//args的解析，还有g_conf，g_ceph_context的生成等等。可以跟其他模块共同生成的都在这里先解析或者生成。
   global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
 	      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
+// -h没法通过通用解析（这个是每个模块独立的需求），留在这里解析了
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ++i) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
       usage();
@@ -1045,28 +1053,37 @@ int main(int argc, const char **argv)
     }
   }
 
+// 判断libcurl是否支持curl_multi_wait，不支持的话跨中心传输性能受影响
   check_curl();
 
   if (g_conf->daemonize) {
     global_init_daemonize(g_ceph_context, 0);
   }
   Mutex mutex("main");
+//  初始化定时器
   SafeTimer init_timer(g_ceph_context, mutex);
   init_timer.init();
   mutex.Lock();
-  init_timer.add_event_after(g_conf->rgw_init_timeout, new C_InitTimeout);
+  init_timer.add_event_after(g_conf->rgw_init_timeout, new C_InitTimeout);//默认300s后，还没初始化完成就报错退出（后面初始化成功要cancel该定时器事件）
   mutex.Unlock();
 
+//  里面调用了start_service_thread-》CephContextServiceThread-》创建了一个线程（不知道干啥的）；启动了admin socket和初始化（admin socket命令的注册在ceph context构造的时候就已经干了）
   common_init_finish(g_ceph_context);
 
+//  主要是解析/etc/mime.types的内容，保存在ext_mime_map里面，用于后续根据后缀获取http的content-type
   rgw_tools_init(g_ceph_context);
 
+// new RGWResolver，用于与域名服务器查询和解析host？？
   rgw_init_resolver();
   
+//后续调用curl的函数都是要调用这个先进行初始化
   curl_global_init(CURL_GLOBAL_ALL);
   
+//  FastCGI初始化，在多线程环境下需要先调用，然后才能FCGX_Accept_r
   FCGX_Init();
 
+//  和rados相关的操作都在RGWRados里了。获得实例 store，获得实例meta_mgr（元数据操作）、data_log，
+// init region、zone，初始化并启动 gc ，获得实例 qutoa_hander
   int r = 0;
   RGWRados *store = RGWStoreManager::get_storage(g_ceph_context,
       g_conf->rgw_enable_gc_threads, g_conf->rgw_enable_quota_threads);
@@ -1079,11 +1096,12 @@ int main(int argc, const char **argv)
     derr << "Couldn't init storage provider (RADOS)" << dendl;
     return EIO;
   }
-  r = rgw_perf_start(g_ceph_context);
+  r = rgw_perf_start(g_ceph_context);//性能计数器初始化？？
 
-  rgw_rest_init(g_ceph_context, store->region);
+  rgw_rest_init(g_ceph_context, store->region);//初始化rest。主要是生成http头属性列表
 
   mutex.Lock();
+//  初始化完成了吧，那就取消和关闭定时器吧
   init_timer.cancel_all_events();
   init_timer.shutdown();
   mutex.Unlock();
@@ -1091,7 +1109,9 @@ int main(int argc, const char **argv)
   if (r) 
     return 1;
 
+//  初始化radosgw中关于用户部分的类RGWUserMetadataHandler，且将该类注册到store->meta_mgr中
   rgw_user_init(store);
+//  函数初始化radosgw中关于bucket部分的类RGWBucketMetadataHandler和RGWBucketInstanceMetadataHandler，且将这两个类注册到store->meta_mgr中；
   rgw_bucket_init(store->meta_mgr);
   rgw_log_usage_init(g_ceph_context, store);
 
@@ -1108,6 +1128,7 @@ int main(int argc, const char **argv)
   }
 
   if (apis_map.count("s3") > 0)
+//	  设置RGWRESTMgr_S3为radosgw中rest接口的默认处理类
     rest.register_default_mgr(set_logging(new RGWRESTMgr_S3));
 
   if (apis_map.count("swift") > 0) {
@@ -1119,6 +1140,7 @@ int main(int argc, const char **argv)
   if (apis_map.count("swift_auth") > 0)
     rest.register_resource(g_conf->rgw_swift_auth_entry, set_logging(new RGWRESTMgr_SWIFT_Auth));
 
+//  对于支持admin的操作来说，注册管理员操作对应的类
   if (apis_map.count("admin") > 0) {
     RGWRESTMgr_Admin *admin_resource = new RGWRESTMgr_Admin;
     admin_resource->register_resource("usage", new RGWRESTMgr_Usage);
@@ -1134,6 +1156,7 @@ int main(int argc, const char **argv)
     rest.register_resource(g_conf->rgw_admin_entry, admin_resource);
   }
 
+//  这个是个日志输出的线程，监控本地unix socket，将操作日志按格式输出至连接过来的进程
   OpsLogSocket *olog = NULL;
 
   if (!g_conf->rgw_ops_log_socket_path.empty()) {
@@ -1141,19 +1164,22 @@ int main(int argc, const char **argv)
     olog->init(g_conf->rgw_ops_log_socket_path);
   }
 
+//  创建一个socketpair（与pipe类似，但是两个都是可读可写）
   r = signal_fd_init();
   if (r < 0) {
     derr << "ERROR: unable to initialize signal fds" << dendl;
     exit(1);
   }
 
+//  异步处理（创建了一个线程）信号量
   init_async_signal_handler();
   register_async_signal_handler(SIGHUP, sighup_handler);
-  register_async_signal_handler(SIGTERM, handle_sigterm);
+  register_async_signal_handler(SIGTERM, handle_sigterm);//这后面三个信号量，都是触发写socketpair的停止指令，后面wait_shutdown阻塞读等待
   register_async_signal_handler(SIGINT, handle_sigterm);
   register_async_signal_handler(SIGUSR1, handle_sigterm);
   sighandler_alrm = signal(SIGALRM, godown_alarm);
 
+//  开始根据配置，解析用前端webserver什么框架，是fastcgi呢还是civetweb呢
   list<string> frontends;
   get_str_list(g_conf->rgw_frontends, ",", frontends);
 
@@ -1201,7 +1227,7 @@ int main(int argc, const char **argv)
     } else if (framework == "civetweb" || framework == "mongoose") {
       int port;
       config->get_val("port", 80, &port);
-
+// 执行的环境，其实就是将这些参数打包传进去啦
       RGWProcessEnv env = { store, &rest, olog, port };
 
       fe = new RGWMongooseFrontend(env, config);
@@ -1222,11 +1248,14 @@ int main(int argc, const char **argv)
       derr << "ERROR: failed initializing frontend" << dendl;
       return -r;
     }
+
+//    终于开始执行了，创建了一个线程
     fe->run();
 
     fes.push_back(fe);
   }
 
+//  阻塞读等待接收停止的指令
   wait_shutdown();
 
   derr << "shutting down" << dendl;

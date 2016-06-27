@@ -275,6 +275,41 @@ public:
 };
 WRITE_CLASS_ENCODER(ACLOwner)
 
+//{
+//     "acl": {
+//         "acl_user_map": [
+//             {
+//                 "user": "osgw-william1",
+//                 "acl": 15
+//             }
+//         ],
+//         "acl_group_map": [],
+//         "grant_map": [
+//             {
+//                 "id": "osgw-william1",
+//                 "grant": {
+//                     "type": {
+//                         "type": 0
+//                     },
+//                     "id": "osgw-william1",
+//                     "email": "",
+//                     "permission": {
+//                         "flags": 15
+//                     },
+//                     "name": "Zone user for yhgtest",
+//                     "group": 0
+//                 }
+//             }
+//         ]
+//     },
+//     "owner": {
+//         "id": "osgw-william1",
+//         "display_name": "Zone user for yhgtest"
+//     }
+// }
+//看上图，15表示1（read），2（write），4（read permission），8（write permission）的叠加
+//"group": 0 表示没有组，1 表示 all users 组，2 表示 authenticated users组
+//"grant": {"type": { "type": 0}...} 0 表示用户，2表示组
 class RGWAccessControlPolicy
 {
 protected:

@@ -89,20 +89,21 @@ void SafeTimer::timer_thread()
     utime_t now = ceph_clock_now(cct);
     
     while (!schedule.empty()) {
+//    	开始遍历
       scheduled_map_t::iterator p = schedule.begin();
 
       // is the future now?
-      if (p->first > now)
+      if (p->first > now)//还没到达时间
 	break;
-
+//处理到达时间的callback
       Context *callback = p->second;
       events.erase(callback);
       schedule.erase(p);
       ldout(cct,10) << "timer_thread executing " << callback << dendl;
       
       if (!safe_callbacks)
-	lock.Unlock();
-      callback->complete(0);
+	lock.Unlock();//          /// 处理事件时，解锁。因为处理事件不会修改定时器本身的数据
+      callback->complete(0);//调用context的complete函数完成callback的使命
       if (!safe_callbacks)
 	lock.Lock();
     }
@@ -113,9 +114,9 @@ void SafeTimer::timer_thread()
 
     ldout(cct,20) << "timer_thread going to sleep" << dendl;
     if (schedule.empty())
-      cond.Wait(lock);
+      cond.Wait(lock);//空了，等待add_event_at有插入时唤醒吧
     else
-      cond.WaitUntil(lock, schedule.begin()->first);
+      cond.WaitUntil(lock, schedule.begin()->first);//没空？等待指定时间
     ldout(cct,20) << "timer_thread awake" << dendl;
   }
   ldout(cct,10) << "timer_thread exiting" << dendl;
@@ -136,19 +137,22 @@ void SafeTimer::add_event_at(utime_t when, Context *callback)
   assert(lock.is_locked());
   ldout(cct,10) << "add_event_at " << when << " -> " << callback << dendl;
 
+//  value_type是个pair类型，map的插入值
   scheduled_map_t::value_type s_val(when, callback);
   scheduled_map_t::iterator i = schedule.insert(s_val);
 
   event_lookup_map_t::value_type e_val(callback, i);
+//  pair是map插入的返回值，first是对应的iterator，second是插入的结果。events保存了callback与其对应的索引iterator
   pair < event_lookup_map_t::iterator, bool > rval(events.insert(e_val));
 
   /* If you hit this, you tried to insert the same Context* twice. */
+//  插入失败，那就是插入重复了吧
   assert(rval.second);
 
   /* If the event we have just inserted comes before everything else, we need to
    * adjust our timeout. */
   if (i == schedule.begin())
-    cond.Signal();
+    cond.Signal();//第一个插入，唤醒处理线程的等待
 
 }
 

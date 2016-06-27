@@ -173,6 +173,7 @@ static int decode_policy(CephContext *cct, bufferlist& bl, RGWAccessControlPolic
 {
   bufferlist::iterator iter = bl.begin();
   try {
+	  //decode出policy
     policy->decode(iter);
   } catch (buffer::error& err) {
     ldout(cct, 0) << "ERROR: could not decode policy, caught buffer::error" << dendl;
@@ -191,6 +192,7 @@ static int get_bucket_policy_from_attr(CephContext *cct, RGWRados *store, void *
                                        RGWBucketInfo& bucket_info, map<string, bufferlist>& bucket_attrs,
                                        RGWAccessControlPolicy *policy, rgw_obj& obj)
 {
+//从之前找到的bucketxattr里获取acl
   map<string, bufferlist>::iterator aiter = bucket_attrs.find(RGW_ATTR_ACL);
 
   if (aiter != bucket_attrs.end()) {
@@ -205,7 +207,7 @@ static int get_bucket_policy_from_attr(CephContext *cct, RGWRados *store, void *
     if (r < 0)
       return r;
 
-    policy->create_default(bucket_info.owner, uinfo.display_name);
+    policy->create_default(bucket_info.owner, uinfo.display_name);//没有找到acl，创建默认权限，owner具有full control
   }
   return 0;
 }
@@ -219,7 +221,7 @@ static int get_obj_policy_from_attr(CephContext *cct, RGWRados *store, RGWObject
 
   RGWRados::Object op_target(store, bucket_info, obj_ctx, obj);
   RGWRados::Object::Read rop(&op_target);
-
+//读取object的元数据，从属性中获取acl
   ret = rop.get_attr(RGW_ATTR_ACL, bl);
   if (ret >= 0) {
     ret = decode_policy(cct, bl, policy);
@@ -256,10 +258,13 @@ static int get_policy_from_attr(CephContext *cct, RGWRados *store, void *ctx,
 
   if (obj.get_object().empty()) {
     rgw_obj instance_obj;
+    //获取instance_obj，多余的？后面没用到
     store->get_bucket_instance_obj(bucket_info.bucket, instance_obj);
+    //返回bucket 的acl
     return get_bucket_policy_from_attr(cct, store, ctx, bucket_info, bucket_attrs,
                                        policy, instance_obj);
   }
+  //获取obj 的acl
   return get_obj_policy_from_attr(cct, store, *(RGWObjectCtx *)ctx, bucket_info, bucket_attrs,
                                   policy, obj);
 }
@@ -293,7 +298,7 @@ static int read_policy(RGWRados *store, struct req_state *s,
                        RGWAccessControlPolicy *policy, rgw_bucket& bucket, rgw_obj_key& object)
 {
   string upload_id;
-  upload_id = s->info.args.get("uploadId");
+  upload_id = s->info.args.get("uploadId");//分片上传id？？
   rgw_obj obj;
 
   if (!s->system_request && bucket_info.flags & BUCKET_SUSPENDED) {
@@ -316,7 +321,7 @@ static int read_policy(RGWRados *store, struct req_state *s,
        that we send a proper error code */
     RGWAccessControlPolicy bucket_policy(s->cct);
     string no_object;
-    rgw_obj no_obj(bucket, no_object);
+    rgw_obj no_obj(bucket, no_object);//没有object的rgw_obj对象，也就是要获取bucket的acl
     ret = get_policy_from_attr(s->cct, store, s->obj_ctx, bucket_info, bucket_attrs, &bucket_policy, no_obj);
     if (ret < 0)
       return ret;
@@ -370,17 +375,17 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
 
     RGWBucketInfo source_info;
 
-    ret = store->get_bucket_info(obj_ctx, copy_source_str, source_info, NULL);
+    ret = store->get_bucket_info(obj_ctx, copy_source_str, source_info, NULL);//从pool .rgw中获取RGWBucketInfo
     if (ret == 0) {
       string& region = source_info.region;
-      s->local_source = store->region.equals(region);
+      s->local_source = store->region.equals(region);//判断是否在同一个region
     }
   }
 
   if (!s->bucket_name_str.empty()) {
     s->bucket_exists = true;
     if (s->bucket_instance_id.empty()) {
-      ret = store->get_bucket_info(obj_ctx, s->bucket_name_str, s->bucket_info, NULL, &s->bucket_attrs);
+      ret = store->get_bucket_info(obj_ctx, s->bucket_name_str, s->bucket_info, NULL, &s->bucket_attrs);//获取请求的bucket的RGWBucketInfo
     } else {
       ret = store->get_bucket_instance_info(obj_ctx, s->bucket_instance_id, s->bucket_info, NULL, &s->bucket_attrs);
     }
@@ -395,6 +400,7 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
 
     if (s->bucket_exists) {
       rgw_obj_key no_obj;
+//获取bucket 的acl
       ret = read_policy(store, s, s->bucket_info, s->bucket_attrs, s->bucket_acl, s->bucket, no_obj);
     } else {
       s->bucket_acl->create_default(s->user.user_id, s->user.display_name);
@@ -408,6 +414,7 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
     if (dest_region != store->region_map.regions.end() && !dest_region->second.endpoints.empty()) {
       s->region_endpoint = dest_region->second.endpoints.front();
     }
+    //   判断所得到的bucketinfo中记录的region和rgw不在一个region
     if (s->bucket_exists && !store->region.equals(region)) {
       ldout(s->cct, 0) << "NOTICE: request for data in a different region (" << region << " != " << store->region.name << ")" << dendl;
       /* we now need to make sure that the operation actually requires copy source, that is
@@ -425,6 +432,7 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
 
   /* we're passed only_bucket = true when we specifically need the bucket's
      acls, that happens on write operations */
+//  不是仅仅读取bucket的acl，而且object不是空的
   if (!only_bucket && !s->object.empty()) {
     if (!s->bucket_exists) {
       return -ERR_NO_SUCH_BUCKET;
@@ -436,6 +444,7 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
     if (prefetch_data) {
       store->set_prefetch_data(s->obj_ctx, obj);
     }
+    //读取object的acl
     ret = read_policy(store, s, s->bucket_info, s->bucket_attrs, s->object_acl, s->bucket, s->object);
   }
 
@@ -482,6 +491,7 @@ int RGWOp::verify_op_mask()
   return 0;
 }
 
+//初始化bucket和user quota
 int RGWOp::init_quota()
 {
   /* no quota enforcement for system requests */
@@ -510,6 +520,7 @@ int RGWOp::init_quota()
     uinfo = &owner_info;
   }
 
+  //bucket > user > region_map  的bucket quota
   if (s->bucket_info.quota.enabled) {
     bucket_quota = s->bucket_info.quota;
   } else if (uinfo->bucket_quota.enabled) {
@@ -518,6 +529,7 @@ int RGWOp::init_quota()
     bucket_quota = store->region_map.bucket_quota;
   }
 
+  //user > region_map  的user quota
   if (uinfo->user_quota.enabled) {
     user_quota = uinfo->user_quota;
   } else {

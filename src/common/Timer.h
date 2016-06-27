@@ -25,6 +25,8 @@ class CephContext;
 class Context;
 class SafeTimerThread;
 
+//定时器定时器，SafeTimer通过multimap数据结构维护定时项，定时项是时间和事件的Pair，定时项在map中按照定时时间从小到大排列。
+//此外，SafeTimer使用一个线程来轮询定时项，当到达定时项指定的时间时执行对应的事件
 class SafeTimer
 {
   // This class isn't supposed to be copied
@@ -39,6 +41,7 @@ class SafeTimer
   friend class SafeTimerThread;
   SafeTimerThread *thread;
 
+//  线程入口函数
   void timer_thread();
   void _shutdown();
 

@@ -150,7 +150,7 @@ req_state::req_state(CephContext *_cct, class RGWEnv *e) : cct(_cct), cio(NULL),
 {
   enable_ops_log = e->conf->enable_ops_log;
   enable_usage_log = e->conf->enable_usage_log;
-  defer_to_bucket_acls = e->conf->defer_to_bucket_acls;
+  defer_to_bucket_acls = e->conf->defer_to_bucket_acls;//这个是预设的bucket的acl？？
   content_started = false;
   format = 0;
   formatter = NULL;

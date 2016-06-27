@@ -157,6 +157,7 @@ int global_init_prefork(CephContext *cct, int)
     return -1;
 
   const md_config_t *conf = cct->_conf;
+//  这个判断多余了吧
   if (!conf->daemonize) {
 
     if (pidfile_write(g_conf) < 0)
@@ -166,6 +167,7 @@ int global_init_prefork(CephContext *cct, int)
   }
 
   // stop log thread
+//  停止log线程
   g_ceph_context->_log->flush();
   g_ceph_context->_log->stop();
   return 0;
@@ -173,9 +175,10 @@ int global_init_prefork(CephContext *cct, int)
 
 void global_init_daemonize(CephContext *cct, int flags)
 {
+//	fork之前的初始化。
   if (global_init_prefork(cct, flags) < 0)
     return;
-
+//调用daemon创建daemon进程
   int ret = daemon(1, 1);
   if (ret) {
     ret = errno;
@@ -184,6 +187,7 @@ void global_init_daemonize(CephContext *cct, int flags)
     exit(1);
   }
  
+// fork之后的初始化。重定向0，1，2到null。进程（变成子进程了）的pid变了，所以要重写pid文件
   global_init_postfork_start(cct);
   global_init_postfork_finish(cct, flags);
 }
