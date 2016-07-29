@@ -56,4 +56,31 @@ public:
   int check(RGWPolicyEnv *env, string& err_msg);
   int from_json(bufferlist& bl, string& err_msg);
 };
+
+class RGWPolicy_Bucket{
+public:
+	string policy;
+
+	RGWPolicy_Bucket(){};
+	~RGWPolicy_Bucket(){};
+
+	void encode(bufferlist& bl) const {
+		ENCODE_START(1, 1, bl);
+		::encode(policy, bl);
+		ENCODE_FINISH(bl);
+	}
+	void decode(bufferlist::iterator& bl) {
+		DECODE_START_LEGACY_COMPAT_LEN(1, 1, 1, bl);
+		::decode(policy, bl);
+		DECODE_FINISH(bl);
+	}
+
+	string tojson(){
+		return policy;
+	}
+
+	bool verify_policy(const string& bucketname,const string& objectname);
+
+	static bool check_valid_json(const string& pol,const string& bucketname);
+};
 #endif

@@ -1536,6 +1536,32 @@ void RGWCopyObj_ObjStore_S3::send_response()
   }
 }
 
+void RGWPutPolicy_ObjStore_S3::send_response(){
+	if (ret)
+		set_req_state_err(s, ret);
+	dump_errno(s);
+	end_header(s, this, "application/xml");
+	dump_start(s);
+}
+
+void RGWDeletePolicy_ObjStore_S3::send_response(){
+	if(ret)
+	  set_req_state_err(s,ret);
+	dump_errno(s);
+	end_header(s,this,"application/xml");
+	dump_start(s);
+}
+
+void RGWGetPolicy_ObjStore_S3::send_response(){
+	if (ret)
+		set_req_state_err(s, ret);
+	dump_errno(s);
+	end_header(s, this, "application/json");
+	dump_start(s);
+	rgw_flush_formatter(s, s->formatter);
+	s->cio->write(policy.c_str(), policy.size());
+}
+
 void RGWGetACLs_ObjStore_S3::send_response()
 {
   if (ret)
@@ -1968,6 +1994,10 @@ RGWOp *RGWHandler_ObjStore_Bucket_S3::op_get()
   if (s->info.args.sub_resource_exists("versioning"))
     return new RGWGetBucketVersioning_ObjStore_S3;
 
+  if(is_policy_op()){
+	  allocate_formatter(s,RGW_FORMAT_JSON,false);
+	  return new RGWGetPolicy_ObjStore_S3;
+  }
   if (is_acl_op()) {
     return new RGWGetACLs_ObjStore_S3;
   } else if (is_cors_op()) {
@@ -1994,6 +2024,9 @@ RGWOp *RGWHandler_ObjStore_Bucket_S3::op_put()
     return NULL;
   if (s->info.args.sub_resource_exists("versioning"))
     return new RGWSetBucketVersioning_ObjStore_S3;
+  if(is_policy_op()){
+	  return new RGWPutPolicy_ObjStore_S3;
+  }
   if (is_acl_op()) {
     return new RGWPutACLs_ObjStore_S3;
   } else if (is_cors_op()) {
@@ -2006,6 +2039,9 @@ RGWOp *RGWHandler_ObjStore_Bucket_S3::op_delete()
 {
   if (is_cors_op()) {
     return new RGWDeleteCORS_ObjStore_S3;
+  }
+  if(is_policy_op()){
+	  return new RGWDeletePolicy_ObjStore_S3;
   }
   return new RGWDeleteBucket_ObjStore_S3;
 }

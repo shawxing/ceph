@@ -295,3 +295,201 @@ int RGWPolicy::from_json(bufferlist& bl, string& err_msg)
   }
   return 0;
 }
+
+static inline bool check_statement_arn(string val,string bucketname){
+	if(val.length() < 15 || val.substr(0,13).compare("arn:aws:s3:::"))
+		return false;
+
+	int pos = val.find("/");
+	if(pos < 0)
+		return false;
+
+	string sub = val.substr(13,pos-13);
+	if(sub.compare(bucketname))
+		return false;
+
+	return true;
+}
+
+static uint8_t wildcmp(const char* wild, const char* string) {
+	const char* cp = NULL;
+	const char*	mp = NULL;
+
+	while (*string && *wild != '*') {
+		if (*wild != *string && *wild != '?') {
+			return 0;
+		}
+		wild++;
+		string++;
+	}
+
+	while (*string) {
+		if (*wild == '*') {
+			if (!*++wild) {
+				return 1;
+			}
+			mp = wild;
+			cp = string + 1;
+		} else if (*wild == *string || *wild == '?') {
+			wild++;
+			string++;
+		} else {
+			wild = mp;
+			string = cp++;
+		}
+	}
+
+	while (*wild == '*') {
+		wild++;
+	}
+	return !*wild;
+}
+
+static bool check_wild(const string& data,const string& bucketname,const string& objectname){
+	if(data.length() < 15 || data.substr(0,13).compare("arn:aws:s3:::"))
+		return false;
+	string sub = data.substr(13,data.length()-13);
+	string url = bucketname + "/" + objectname;
+	return wildcmp(sub.c_str(),url.c_str());
+}
+
+bool RGWPolicy_Bucket::verify_policy(const string& bucketname,const string& objectname){
+	if(policy.empty())
+		return false;
+
+	JSONParser parser;
+	JSONObjIter iter;
+	JSONObj* obj;
+
+	if(!parser.parse(policy.c_str(),policy.length()))
+		return false;
+
+	iter = parser.find_first("Statement");
+	if(iter.end() || !(*iter)->is_array())
+		return false;
+
+	iter = (*iter)->find_first();
+	if(iter.end())
+		return false;
+
+	for(;!iter.end();++iter){
+		obj = *iter;
+		if(!obj->is_object())
+			return false;
+
+		JSONObjIter iiter = obj->find_first("Resource");
+		if(iiter.end())
+			return false;
+		JSONObj *iobj = *iiter;
+		if(iobj->get_data_type() == str_type && check_wild(iobj->get_data(),bucketname,objectname))
+			return true;
+		else if(iobj->is_array()){
+			JSONObjIter itmp = iobj->find_first();
+			for(;!itmp.end();++itmp){
+				if(check_wild((*itmp)->get_data(),bucketname,objectname))
+					return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+bool RGWPolicy_Bucket::check_valid_json(const string& pol,const string& bucketname)
+{
+	if(pol.empty())
+		return false;
+
+	JSONParser parser;
+	JSONObjIter iter;
+	JSONObj* obj;
+	if(!parser.parse(pol.c_str(),pol.length()))
+		return false;
+	iter = parser.find("Id");
+	if(!iter.end()){
+		obj = *iter;
+		if(obj->is_array())
+			return false;
+		if(obj->get_data_type()!=str_type)
+			return false;
+	}
+
+	iter = parser.find_first("Version");
+	if(!iter.end()){
+		obj = *iter;
+		if(obj->is_array())
+			return false;
+		if(obj->get_data_type()!=str_type || obj->get_data().compare("2008-10-17"))
+			return false;
+	}
+
+	iter = parser.find_first("Statement");
+	if(iter.end() || !(*iter)->is_array())
+		return false;
+
+	iter = (*iter)->find_first();
+	if(iter.end())
+		return false;
+
+	for(;!iter.end();++iter){
+		obj = *iter;
+		if(!obj->is_object())
+			return false;
+
+		JSONObjIter iiter = (*iter)->find_first();
+		JSONObj *iobj;
+		uint8_t flag = 0;
+		for(;!iiter.end();++iiter){
+			iobj = *iiter;
+			if(!iobj->get_name().compare("Sid") && iobj->get_data_type()!=str_type)
+				return false;
+			else if(!iobj->get_name().compare("Effect")){
+				if(iobj->get_data_type() == str_type && !iobj->get_data().compare("Allow"))
+					flag |= 1;
+			}
+			else if(!iobj->get_name().compare("Action")){
+				if(iobj->get_data_type() == str_type && !iobj->get_data().compare("s3:GetObject"))
+					flag |= 2;
+				else if(iobj->is_array()){
+					vector<string> v = iobj->get_array_elements();
+					vector<string>::iterator i=std::find(v.begin(),v.end(),"s3:GetObject");
+					if(i != v.end())
+						flag |= 2;
+				}
+			}
+			else if(!iobj->get_name().compare("Principal")){
+				if(iobj->get_data_type() == str_type && !iobj->get_data().compare("*"))
+					flag |= 4;
+				else if(iobj->is_object()){
+					JSONObjIter itmp = iobj->find_first("AWS");
+					if(itmp.end() || (*itmp)->get_data_type()!=str_type || (*itmp)->get_data().compare("*"))
+						return false;
+					else
+						flag |= 4;
+				}
+			}
+			else if(!iobj->get_name().compare("Resource")){
+				if(iobj->get_data_type() == str_type && check_statement_arn(iobj->get_data(),bucketname))
+					flag |= 8;
+				else if(iobj->is_array()){
+					JSONObjIter itmp = iobj->find_first();
+					bool ret = true;
+					for(;!itmp.end();++itmp){
+						if(!check_statement_arn((*itmp)->get_data(),bucketname)){
+							ret = false;
+							break;
+						}
+					}
+
+					if(ret)
+						flag |= 8;
+				}
+			}
+		}
+
+		if(flag != 15)
+			return false;
+	}
+
+	return true;
+}

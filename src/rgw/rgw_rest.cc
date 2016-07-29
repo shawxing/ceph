@@ -882,6 +882,29 @@ int RGWPostObj_ObjStore::verify_params()
   return 0;
 }
 
+int RGWPutPolicy_ObjStore::get_params(){
+	size_t cl = 0;
+	if (s->length)
+		cl = atoll(s->length);
+	if (cl) {
+		data = (char *) malloc(cl + 1);
+		if (!data) {
+			ret = -ENOMEM;
+			return ret;
+		}
+		int read_len;
+		int r = s->cio->read(data, cl, &read_len);
+		len = read_len;
+		if (r < 0)
+			return r;
+		data[len] = '\0';
+	} else {
+		len = 0;
+	}
+
+	return ret;
+}
+
 int RGWPutACLs_ObjStore::get_params()
 {
   size_t cl = 0;

@@ -28,6 +28,7 @@
 #include "include/types.h"
 #include "include/utime.h"
 #include "rgw_acl.h"
+#include "rgw_policy_s3.h"
 #include "rgw_cors.h"
 #include "rgw_quota.h"
 #include "rgw_string.h"
@@ -55,6 +56,7 @@ using ceph::crypto::MD5;
 #define RGW_SYS_PARAM_PREFIX "rgwx-"
 
 #define RGW_ATTR_ACL		RGW_ATTR_PREFIX "acl"
+#define RGW_ATTR_POLICY		RGW_ATTR_PREFIX "policy"
 #define RGW_ATTR_CORS		RGW_ATTR_PREFIX "cors"
 #define RGW_ATTR_ETAG    	RGW_ATTR_PREFIX "etag"
 #define RGW_ATTR_BUCKETS	RGW_ATTR_PREFIX "buckets"
@@ -904,9 +906,9 @@ class RGWEnv;
 class RGWClientIO;
 
 struct req_info {
-  RGWEnv *env;
-  RGWHTTPArgs args;
-  map<string, string> x_meta_map;
+  RGWEnv *env;//所有请求头部，还包括了QUERY_STRING，REQUEST_URI，SERVER_PORT等
+  RGWHTTPArgs args;//?后面的参数
+  map<string, string> x_meta_map;//以x-amz开头的头部
 
   string host;
   const char *method;
@@ -1034,6 +1036,7 @@ struct req_state {
    RGWUserInfo user; 
    RGWAccessControlPolicy *bucket_acl;
    RGWAccessControlPolicy *object_acl;
+   RGWPolicy_Bucket *bucket_policy;
 
    bool system_request;
 
@@ -1230,7 +1233,8 @@ public:
      * For backward compatibility. Older versions used to have object locator on all objects,
      * however, the orig_obj was the effective object locator. This had the same effect as not
      * having object locator at all for most objects but the ones that started with underscore as
-     * these were escaped.
+     * these were escaped.为了兼容，旧版本所有object都有locator。现在orig_obj有了相同的功能，就不要locator了。但是
+     * 还有一种情况，就是orig_obj以下划线开头。
      */
     if (orig_obj[0] == '_' && ns.empty()) {
       loc = orig_obj;
@@ -1252,18 +1256,19 @@ public:
   void set_obj(const string& o) {
     object.reserve(128);
 
-    orig_obj = o;
-    if (ns.empty() && !need_to_encode_instance()) {
+    orig_obj = o;//orig_obj将负责保存objectname
+    if (ns.empty() && !need_to_encode_instance()) {//ns为空且instance为空或null
       if (o.empty()) {
         return;
       }
-      if (o.size() < 1 || o[0] != '_') {
+      if (o.size() < 1 || o[0] != '_') {//o不以_开头的话，直接将object设置为o
         object = o;
         return;
       }
+      //o以_开头，直接前面再加一个_
       object = "_";
       object.append(o);
-    } else {
+    } else {//否则，将object设置为 _ns[:instance]_o的形式
       object = "_";
       object.append(ns);
       if (need_to_encode_instance()) {

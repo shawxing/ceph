@@ -66,6 +66,7 @@ public:
 
   bool is_array();
   bool is_object();
+  Value_type get_data_type();
   vector<string> get_array_elements();
 };
 

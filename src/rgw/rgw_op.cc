@@ -17,6 +17,7 @@
 #include "rgw_rest.h"
 #include "rgw_acl.h"
 #include "rgw_acl_s3.h"
+#include "rgw_policy_s3.h"
 #include "rgw_user.h"
 #include "rgw_bucket.h"
 #include "rgw_log.h"
@@ -188,7 +189,24 @@ static int decode_policy(CephContext *cct, bufferlist& bl, RGWAccessControlPolic
   return 0;
 }
 
-static int get_bucket_policy_from_attr(CephContext *cct, RGWRados *store, void *ctx,
+static int get_bucket_policy_from_attr(CephContext *cct,map<string, bufferlist>& bucket_attrs,RGWPolicy_Bucket **bucket_policy){
+	map<string, bufferlist>::iterator aiter = bucket_attrs.find(RGW_ATTR_POLICY);
+	if (aiter != bucket_attrs.end()) {
+		if(*bucket_policy){
+			delete *bucket_policy;
+			*bucket_policy=NULL;
+		}
+		*bucket_policy = new RGWPolicy_Bucket;
+		bufferlist::iterator iter = aiter->second.begin();
+		ldout(cct, 15) << "before decode"<< dendl;
+		(*bucket_policy)->decode(iter);
+		ldout(cct, 15) << "after decode"<<dendl;
+	}
+
+	return 0;
+}
+
+static int get_bucket_acl_from_attr(CephContext *cct, RGWRados *store, void *ctx,
                                        RGWBucketInfo& bucket_info, map<string, bufferlist>& bucket_attrs,
                                        RGWAccessControlPolicy *policy, rgw_obj& obj)
 {
@@ -212,7 +230,7 @@ static int get_bucket_policy_from_attr(CephContext *cct, RGWRados *store, void *
   return 0;
 }
 
-static int get_obj_policy_from_attr(CephContext *cct, RGWRados *store, RGWObjectCtx& obj_ctx,
+static int get_obj_acl_from_attr(CephContext *cct, RGWRados *store, RGWObjectCtx& obj_ctx,
                                     RGWBucketInfo& bucket_info, map<string, bufferlist>& bucket_attrs,
                                     RGWAccessControlPolicy *policy, rgw_obj& obj)
 {
@@ -240,7 +258,6 @@ static int get_obj_policy_from_attr(CephContext *cct, RGWRados *store, RGWObject
   return ret;
 }
 
-
 /**
  * Get the AccessControlPolicy for an object off of disk.
  * policy: must point to a valid RGWACL, and will be filled upon return.
@@ -248,7 +265,7 @@ static int get_obj_policy_from_attr(CephContext *cct, RGWRados *store, RGWObject
  * object: name of the object to get the ACL for.
  * Returns: 0 on success, -ERR# otherwise.
  */
-static int get_policy_from_attr(CephContext *cct, RGWRados *store, void *ctx,
+static int get_acl_from_attr(CephContext *cct, RGWRados *store, void *ctx,
                                 RGWBucketInfo& bucket_info, map<string, bufferlist>& bucket_attrs,
                                 RGWAccessControlPolicy *policy, rgw_obj& obj)
 {
@@ -261,11 +278,11 @@ static int get_policy_from_attr(CephContext *cct, RGWRados *store, void *ctx,
     //获取instance_obj，多余的？后面没用到
     store->get_bucket_instance_obj(bucket_info.bucket, instance_obj);
     //返回bucket 的acl
-    return get_bucket_policy_from_attr(cct, store, ctx, bucket_info, bucket_attrs,
+    return get_bucket_acl_from_attr(cct, store, ctx, bucket_info, bucket_attrs,
                                        policy, instance_obj);
   }
   //获取obj 的acl
-  return get_obj_policy_from_attr(cct, store, *(RGWObjectCtx *)ctx, bucket_info, bucket_attrs,
+  return get_obj_acl_from_attr(cct, store, *(RGWObjectCtx *)ctx, bucket_info, bucket_attrs,
                                   policy, obj);
 }
 
@@ -315,14 +332,14 @@ static int read_policy(RGWRados *store, struct req_state *s,
   } else {
     obj = rgw_obj(bucket, object);
   }
-  int ret = get_policy_from_attr(s->cct, store, s->obj_ctx, bucket_info, bucket_attrs, policy, obj);
+  int ret = get_acl_from_attr(s->cct, store, s->obj_ctx, bucket_info, bucket_attrs, policy, obj);
   if (ret == -ENOENT && !object.empty()) {
     /* object does not exist checking the bucket's ACL to make sure
        that we send a proper error code */
     RGWAccessControlPolicy bucket_policy(s->cct);
     string no_object;
     rgw_obj no_obj(bucket, no_object);//没有object的rgw_obj对象，也就是要获取bucket的acl
-    ret = get_policy_from_attr(s->cct, store, s->obj_ctx, bucket_info, bucket_attrs, &bucket_policy, no_obj);
+    ret = get_acl_from_attr(s->cct, store, s->obj_ctx, bucket_info, bucket_attrs, &bucket_policy, no_obj);
     if (ret < 0)
       return ret;
     string& owner = bucket_policy.get_owner().get_id();
@@ -334,6 +351,14 @@ static int read_policy(RGWRados *store, struct req_state *s,
 
   } else if (ret == -ENOENT) {
       ret = -ERR_NO_SUCH_BUCKET;
+  }
+
+  //todo:暂时设置为存在policy就可以放开object的读写权限
+  ret = get_bucket_policy_from_attr(s->cct,bucket_attrs,&s->bucket_policy);
+  if(s->bucket_policy && !object.empty() && s->bucket_policy->verify_policy(s->bucket_name_str,object.name)){
+	  ACLGrant grant;
+	  grant.set_group(ACL_GROUP_ALL_USERS, RGW_PERM_READ | RGW_PERM_WRITE);
+	  policy->get_acl().add_grant(&grant);
   }
 
   return ret;
@@ -949,7 +974,7 @@ void RGWGetObj::execute()
   if (ret < 0)
     goto done_err;
 
-  attr_iter = attrs.find(RGW_ATTR_USER_MANIFEST);
+  attr_iter = attrs.find(RGW_ATTR_USER_MANIFEST);//user_manifest??好像还用不着这个属性
   if (attr_iter != attrs.end()) {
     ret = handle_user_manifest(attr_iter->second.c_str());
     if (ret < 0) {
@@ -1344,7 +1369,7 @@ void RGWCreateBucket::execute()
   s->bucket_owner.set_id(s->user.user_id);
   s->bucket_owner.set_name(s->user.display_name);
   if (s->bucket_exists) {
-    int r = get_policy_from_attr(s->cct, store, s->obj_ctx, s->bucket_info, s->bucket_attrs,
+    int r = get_acl_from_attr(s->cct, store, s->obj_ctx, s->bucket_info, s->bucket_attrs,
                                  &old_policy, obj);
     if (r >= 0)  {
       if (old_policy.get_owner().get_id().compare(s->user.user_id) != 0) {
@@ -1579,7 +1604,7 @@ int RGWPutObjProcessor_Multipart::prepare(RGWRados *store, string *oid_rand)
   target_obj.init(bucket, oid);
 
   manifest.set_prefix(upload_prefix);
-
+//设置multipart的rule0，olh大小为0
   manifest.set_multipart_part_rule(store->ctx()->_conf->rgw_obj_stripe_size, num);
 
   r = manifest_gen.create_begin(store->ctx(), &manifest, bucket, target_obj);
@@ -1664,6 +1689,7 @@ RGWPutObjProcessor *RGWPutObj::select_processor(RGWObjectCtx& obj_ctx, bool *is_
 
   uint64_t part_size = s->cct->_conf->rgw_obj_stripe_size;
 
+  //不是multipart上传
   if (!multipart) {
     processor = new RGWPutObjProcessor_Atomic(obj_ctx, s->bucket_info, s->bucket, s->object.name, part_size, s->req_id, s->bucket_info.versioning_enabled());
     ((RGWPutObjProcessor_Atomic *)processor)->set_olh_epoch(olh_epoch);
@@ -1772,6 +1798,7 @@ void RGWPutObj::execute()
     need_calc_md5 = true;
 
     ldout(s->cct, 15) << "supplied_md5_b64=" << supplied_md5_b64 << dendl;
+    //把base64形式的md5解为char的
     ret = ceph_unarmor(supplied_md5_bin, &supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1],
                        supplied_md5_b64, supplied_md5_b64 + strlen(supplied_md5_b64));
     ldout(s->cct, 15) << "ceph_armor ret=" << ret << dendl;
@@ -1780,6 +1807,7 @@ void RGWPutObj::execute()
       goto done;
     }
 
+    //将char形式的md5转为16进制的形式，一个字符一个字节，占两个16进制数字，这样的话长度变成CEPH_CRYPTO_MD5_DIGESTSIZE*2
     buf_to_hex((const unsigned char *)supplied_md5_bin, CEPH_CRYPTO_MD5_DIGESTSIZE, supplied_md5);
     ldout(s->cct, 15) << "supplied_md5=" << supplied_md5 << dendl;
   }
@@ -1793,6 +1821,7 @@ void RGWPutObj::execute()
     }
   }
 
+  //etag直接就是16进制形式的md5
   if (supplied_etag) {
     strncpy(supplied_md5, supplied_etag, sizeof(supplied_md5) - 1);
     supplied_md5[sizeof(supplied_md5) - 1] = '\0';
@@ -1806,7 +1835,7 @@ void RGWPutObj::execute()
 
   do {
     bufferlist data;
-    len = get_data(data);
+    len = get_data(data);//获取数据
     if (len < 0) {
       ret = len;
       goto done;
@@ -1817,6 +1846,7 @@ void RGWPutObj::execute()
     /* do we need this operation to be synchronous? if we're dealing with an object with immutable
      * head, e.g., multipart object we need to make sure we're the first one writing to this object
      */
+    //需要同步操作，当我们处理multipart的第一部分的时候？？
     bool need_to_wait = (ofs == 0) && multipart;
 
     bufferlist orig_data;
@@ -1870,19 +1900,19 @@ void RGWPutObj::execute()
   perfcounter->inc(l_rgw_put_b, s->obj_size);
 
   ret = store->check_quota(s->bucket_owner.get_id(), s->bucket,
-                           user_quota, bucket_quota, s->obj_size);
+                           user_quota, bucket_quota, s->obj_size);//检查配额
   if (ret < 0) {
     goto done;
   }
 
   if (need_calc_md5) {
-    processor->complete_hash(&hash);
+    processor->complete_hash(&hash);//最后一部分数据计算hash，这个地方我觉得应该等写完再计算吧？
     hash.Final(m);
 
     buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
     etag = calc_md5;
 
-    if (supplied_md5_b64 && strcmp(calc_md5, supplied_md5)) {
+    if (supplied_md5_b64 && strcmp(calc_md5, supplied_md5)) {//对比计算的md5
       ret = -ERR_BAD_DIGEST;
       goto done;
     }
@@ -1919,7 +1949,7 @@ void RGWPutObj::execute()
 
     etag = etag_buf_str;
   }
-  if (supplied_etag && etag.compare(supplied_etag) != 0) {
+  if (supplied_etag && etag.compare(supplied_etag) != 0) {//对比etag(16进制的md5)
     ret = -ERR_UNPROCESSABLE_ENTITY;
     goto done;
   }
@@ -1930,9 +1960,9 @@ void RGWPutObj::execute()
     bufferlist& attrbl = attrs[iter->first];
     const string& val = iter->second;
     attrbl.append(val.c_str(), val.size() + 1);
-  }
+  }//content-disposition属性
 
-  rgw_get_request_metadata(s->cct, s->info, attrs);
+  rgw_get_request_metadata(s->cct, s->info, attrs);//x-amz-date属性
 
   ret = processor->complete(etag, &mtime, 0, attrs, if_match, if_nomatch);
 done:
@@ -2455,6 +2485,77 @@ void RGWCopyObj::execute()
                         );
 }
 
+static int verify_policy_permission(struct req_state *s){
+	if(!s->bucket_name_str.empty())
+	{
+		return s->user.user_id.compare(s->bucket_info.owner) == 0 ? 0 : -EACCES;
+	}
+	else
+		return -EACCES;
+}
+
+int RGWPutPolicy::verify_permission(){
+	return verify_policy_permission(s);
+}
+
+void RGWPutPolicy::pre_exec(){
+	rgw_bucket_object_pre_exec(s);
+}
+
+void RGWPutPolicy::execute() {
+	bufferlist bl;
+	RGWPolicy_Bucket bucketpolicy;
+	rgw_obj obj;
+
+	ret = get_params();
+	if (ret < 0)
+		return;
+
+	ldout(s->cct, 15)<< "read len=" << len << " data=" << (data ? data : "") << dendl;
+
+	if(strlen(data)==0 || !RGWPolicy_Bucket::check_valid_json(data,s->bucket_name_str)){
+		ret = -EINVAL;
+		return;
+	}
+
+	bucketpolicy.policy = data;
+	bucketpolicy.encode(bl);
+	obj = rgw_obj(s->bucket, s->object);
+	map<string, bufferlist> attrs;
+	store->set_atomic(s->obj_ctx, obj);
+
+	attrs[RGW_ATTR_POLICY] = bl;
+
+	ret = rgw_bucket_set_attrs(store, s->bucket_info, attrs, NULL, &s->bucket_info.objv_tracker);
+}
+
+int RGWDeletePolicy::verify_permission(){
+	return verify_policy_permission(s);
+}
+
+void RGWDeletePolicy::execute(){
+	bufferlist bl;
+	RGWPolicy_Bucket bucketpolicy;
+	map<string, bufferlist> attrs, rmattrs;
+
+	rmattrs[RGW_ATTR_POLICY] = bl;
+
+	ret = rgw_bucket_set_attrs(store, s->bucket_info, attrs, &rmattrs, &s->bucket_info.objv_tracker);
+}
+
+int RGWGetPolicy::verify_permission(){
+	return verify_policy_permission(s);
+}
+
+void RGWGetPolicy::pre_exec(){
+	rgw_bucket_object_pre_exec(s);
+}
+
+void RGWGetPolicy::execute(){
+	if(s->bucket_policy)
+		policy = s->bucket_policy->tojson();
+}
+
 int RGWGetACLs::verify_permission()
 {
   bool perm;
@@ -2482,8 +2583,6 @@ void RGWGetACLs::execute()
   s3policy->to_xml(ss);
   acls = ss.str();
 }
-
-
 
 int RGWPutACLs::verify_permission()
 {

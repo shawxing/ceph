@@ -201,6 +201,30 @@ public:
   void send_response();
 };
 
+class RGWGetPolicy_ObjStore_S3 : public RGWGetPolicy_ObjStore {
+public:
+	RGWGetPolicy_ObjStore_S3(){};
+	~RGWGetPolicy_ObjStore_S3(){};
+
+	void send_response();
+};
+
+class RGWPutPolicy_ObjStore_S3 : public RGWPutPolicy_ObjStore {
+public:
+	RGWPutPolicy_ObjStore_S3(){};
+	~RGWPutPolicy_ObjStore_S3(){};
+
+	void send_response();
+};
+
+class RGWDeletePolicy_ObjStore_S3:public RGWDeletePolicy_ObjStore {
+public:
+	RGWDeletePolicy_ObjStore_S3(){};
+	~RGWDeletePolicy_ObjStore_S3(){};
+
+	void send_response();
+};
+
 class RGWGetCORS_ObjStore_S3 : public RGWGetCORS_ObjStore {
 public:
   RGWGetCORS_ObjStore_S3() {}
@@ -395,6 +419,9 @@ protected:
   }
   bool is_cors_op() {
       return s->info.args.exists("cors");
+  }
+  bool is_policy_op(){
+	  return s->info.args.exists("policy");
   }
   bool is_obj_update_op() {
     return is_acl_op() || is_cors_op();

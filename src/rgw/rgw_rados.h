@@ -42,7 +42,7 @@ static inline void prepend_bucket_marker(rgw_bucket& bucket, const string& orig_
     oid.append(orig_oid);
   }
 }
-
+//获取bucket，用obj的bucket；获取oid，用buket.maker_加前缀；若有locator，一样加前缀
 static inline void get_obj_bucket_and_oid_loc(const rgw_obj& obj, rgw_bucket& bucket, string& oid, string& locator)
 {
   bucket = obj.bucket;
@@ -297,7 +297,7 @@ public:
     RGWObjManifestRule rule(0, 0, 0, stripe_max_size);
     rule.start_part_num = part_num;
     rules[0] = rule;
-    max_head_size = 0;
+    max_head_size = 0;//multipart不需要写olh分片(在init的时候已经写了)。将其设置max_head_size为0
   }
 
   void encode(bufferlist& bl) const {
@@ -597,23 +597,23 @@ struct RGWUploadPartInfo {
   static void generate_test_instances(list<RGWUploadPartInfo*>& o);
 };
 WRITE_CLASS_ENCODER(RGWUploadPartInfo)
-
+//对象的状态，属性全在这里了
 struct RGWObjState {
   rgw_obj obj;
   bool is_atomic;
   bool has_attrs;
   bool exists;
-  uint64_t size;
-  time_t mtime;
+  uint64_t size;//大小
+  time_t mtime;//修改时间
   uint64_t epoch;
   bufferlist obj_tag;
   string write_tag;
   bool fake_tag;
-  RGWObjManifest manifest;
+  RGWObjManifest manifest;//保存对象的头部obj，prefix，分片rules等
   bool has_manifest;
   string shadow_obj;
   bool has_data;
-  bufferlist data;
+  bufferlist data;//读取或者写入时保存数据
   bool prefetch_data;
   bool keep_tail;
   bool is_olh;
@@ -623,7 +623,7 @@ struct RGWObjState {
 
   RGWObjVersionTracker objv_tracker;
 
-  map<string, bufferlist> attrset;
+  map<string, bufferlist> attrset;//对象的属性集，如attrset[RGW_ATTR_MANIFEST]
   RGWObjState() : is_atomic(false), has_attrs(0), exists(false),
                   size(0), mtime(0), epoch(0), fake_tag(false), has_manifest(false),
                   has_data(false), prefetch_data(false), keep_tail(false), is_olh(false) {}

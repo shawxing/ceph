@@ -149,6 +149,7 @@ void RGWObjManifest::generate_test_instances(std::list<RGWObjManifest*>& o)
 void RGWObjManifest::get_implicit_location(uint64_t cur_part_id, uint64_t cur_stripe, uint64_t ofs, string *override_prefix, rgw_obj *location)
 {
   string oid;
+  //oid首先设置为prefix
   if (!override_prefix || override_prefix->empty()) {
     oid = prefix;
   } else {
@@ -156,31 +157,31 @@ void RGWObjManifest::get_implicit_location(uint64_t cur_part_id, uint64_t cur_st
   }
   string ns;
 
-  if (!cur_part_id) {
-    if (ofs < max_head_size) {
-      *location = head_obj;
+  if (!cur_part_id) {//第一个part，是不是multipart都可以
+    if (ofs < max_head_size) {//若是olh。
+      *location = head_obj;//例如：default.4142.1_Photoshop.exe，default.4142.1是bucketid
       return;
-    } else {
+    } else {//不是olh，那就是part的tail。
       char buf[16];
       snprintf(buf, sizeof(buf), "%d", (int)cur_stripe);
-      oid += buf;
-      ns = shadow_ns;
+      oid += buf;//oid再加cur_stripe,即prefix+cur_stripe（形如.XXX_1），其cur_stripe肯定从1开始，因为0是olh
+      ns = shadow_ns;//ns设置为shadow，则总体变成形如：_ns_prefix1(例如：default.4142.1__shadow_.Sztdy8V3HH4iYBNTu965_p-CnVMvswf_1)
     }
-  } else {
+  } else {//不是第一个part，那就是multipart的第二个part开始
     char buf[32];
     if (cur_stripe == 0) {
       snprintf(buf, sizeof(buf), ".%d", (int)cur_part_id);
       oid += buf;
-      ns= RGW_OBJ_NS_MULTIPART;
+      ns= RGW_OBJ_NS_MULTIPART;//ns设置为multipart，形如_ns_prefix.1
     } else {
       snprintf(buf, sizeof(buf), ".%d_%d", (int)cur_part_id, (int)cur_stripe);
       oid += buf;
-      ns = shadow_ns;
+      ns = shadow_ns;//ns设置为shadow，形如:_ns_prefix.1_1
     }
   }
 
   rgw_bucket *bucket;
-
+  /* tail_bucket might be different than the original bucket,as object might have been copied across buckets */
   if (!tail_bucket.name.empty()) {
     bucket = &tail_bucket;
   } else {

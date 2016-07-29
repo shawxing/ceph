@@ -60,6 +60,9 @@ enum RGWOpType {
   RGW_OP_LIST_MULTIPART,
   RGW_OP_LIST_BUCKET_MULTIPARTS,
   RGW_OP_DELETE_MULTI_OBJ,
+  RGW_OP_GET_POLICY,
+  RGW_OP_PUT_POLICY,
+  RGW_OP_DELETE_POLICY,
 };
 
 /**
@@ -646,6 +649,68 @@ public:
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
+class RGWPutPolicy: public RGWOp{
+protected:
+	int ret;
+	size_t len;
+	char *data;
+
+public:
+	RGWPutPolicy():ret(0),len(0),data(NULL){};
+
+	int verify_permission();
+	void pre_exec();
+	void execute();
+
+	virtual int get_params() = 0;
+	virtual void send_response() = 0;
+	virtual const string name(){ return "put_policy";}
+	virtual RGWOpType get_type(){ return RGW_OP_PUT_POLICY;}
+	virtual uint32_t op_mask() {return RGW_OP_TYPE_WRITE;}
+};
+
+class RGWGetPolicy: public RGWOp{
+protected:
+	int ret;
+	string policy;
+
+public:
+	RGWGetPolicy ():ret(0){}
+
+	int verify_permission();
+	void pre_exec();
+	void execute();
+
+	virtual void send_response()=0;
+	virtual const string name() {
+		return "get_policy";
+	}
+	virtual RGWOpType get_type() {
+		return RGW_OP_GET_POLICY;
+	}
+	virtual uint32_t op_mask() {
+		return RGW_OP_TYPE_READ;
+	}
+};
+
+class RGWDeletePolicy : public RGWOp{
+protected:
+	int ret;
+	size_t len;
+
+public:
+	RGWDeletePolicy():ret(0),len(0){};
+
+	int verify_permission();
+	void pre_exec(){};
+	void execute();
+
+	virtual void send_response() = 0;
+	virtual const string name() {return "delete_policy";}
+	virtual RGWOpType get_type(){return RGW_OP_DELETE_POLICY;}
+	virtual uint32_t op_mask(){return RGW_OP_TYPE_WRITE;}
+};
+
 class RGWGetACLs : public RGWOp {
 protected:
   int ret;
@@ -658,10 +723,16 @@ public:
   void pre_exec();
   void execute();
 
-  virtual void send_response() = 0;
-  virtual const string name() { return "get_acls"; }
-  virtual RGWOpType get_type() { return RGW_OP_GET_ACLS; }
-  virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+	virtual void send_response() = 0;
+	virtual const string name() {
+		return "get_acls";
+	}
+	virtual RGWOpType get_type() {
+		return RGW_OP_GET_ACLS;
+	}
+	virtual uint32_t op_mask() {
+		return RGW_OP_TYPE_READ;
+	}
 };
 
 class RGWPutACLs : public RGWOp {

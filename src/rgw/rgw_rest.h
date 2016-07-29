@@ -202,6 +202,26 @@ public:
   int get_params();
 };
 
+class RGWGetPolicy_ObjStore : public RGWGetPolicy{
+public:
+	RGWGetPolicy_ObjStore(){};
+	~RGWGetPolicy_ObjStore(){};
+};
+
+class RGWPutPolicy_ObjStore : public RGWPutPolicy{
+public:
+	RGWPutPolicy_ObjStore(){};
+	~RGWPutPolicy_ObjStore(){};
+
+	int get_params();
+};
+
+class RGWDeletePolicy_ObjStore: public RGWDeletePolicy{
+public:
+	RGWDeletePolicy_ObjStore(){};
+	~RGWDeletePolicy_ObjStore(){};
+};
+
 class RGWGetCORS_ObjStore : public RGWGetCORS {
 public:
   RGWGetCORS_ObjStore() {}

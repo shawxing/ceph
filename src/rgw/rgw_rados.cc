@@ -550,7 +550,7 @@ void RGWObjVersionTracker::prepare_op_for_write(ObjectWriteOperation *op)
 
 void RGWObjManifest::obj_iterator::operator++()
 {
-  if (manifest->explicit_objs) {
+  if (manifest->explicit_objs) {//旧的manifest
     ++explicit_iter;
 
     if (explicit_iter == manifest->objs.end()) {
@@ -576,17 +576,17 @@ void RGWObjManifest::obj_iterator::operator++()
   }
 
   /* are we still pointing at the head? */
-  if (ofs < head_size) {
+  if (ofs < head_size) {//正在处理head呢
     rule_iter = manifest->rules.begin();
     RGWObjManifestRule *rule = &rule_iter->second;
     ofs = MIN(head_size, obj_size);
     stripe_ofs = ofs;
     cur_stripe = 1;
-    stripe_size = MIN(obj_size - ofs, rule->stripe_max_size);
+    stripe_size = MIN(obj_size - ofs, rule->stripe_max_size);//分片大小
     if (rule->part_size > 0) {
       stripe_size = MIN(stripe_size, rule->part_size);
     }
-    update_location();
+    update_location();//更新获取要操作的分片的obj
     return;
   }
 
@@ -650,8 +650,9 @@ int RGWObjManifest::generator::create_begin(CephContext *cct, RGWObjManifest *_m
 
   if (manifest->get_prefix().empty()) {
     char buf[33];
-    gen_rand_alphanumeric(cct, buf, sizeof(buf) - 1);
+    gen_rand_alphanumeric(cct, buf, sizeof(buf) - 1);//生成prefix，可能会包含下划线
 
+    //前面加.后面加_
     string oid_prefix = ".";
     oid_prefix.append(buf);
     oid_prefix.append("_");
@@ -659,6 +660,7 @@ int RGWObjManifest::generator::create_begin(CephContext *cct, RGWObjManifest *_m
     manifest->set_prefix(oid_prefix);
   }
 
+  //获取RGWObjManifest的rule0
   bool found = manifest->get_rule(0, &rule);
   if (!found) {
     derr << "ERROR: manifest->get_rule() could not find rule" << dendl;
@@ -667,21 +669,23 @@ int RGWObjManifest::generator::create_begin(CephContext *cct, RGWObjManifest *_m
 
   uint64_t head_size = manifest->get_head_size();
 
+  //设置当前分片大小，olh设置为head_size，tail设置为rule.stripe_max_size
   if (head_size > 0) {
     cur_stripe_size = head_size;
   } else {
     cur_stripe_size = rule.stripe_max_size;
   }
-  
+  //当前part的序号，不是multipart的话为总是为0，因为只有一块
+  //当是multipart时，每个part大小要是大于cur_stripe_size，将继续分片保存，而这时分片序号就是cur_stripe
   cur_part_id = rule.start_part_num;
-
+  //设置curobj
   manifest->get_implicit_location(cur_part_id, cur_stripe, 0, NULL, &cur_obj);
 
   manifest->update_iterators();
 
   return 0;
 }
-
+//计算下一个分片的位置
 int RGWObjManifest::generator::create_next(uint64_t ofs)
 {
   if (ofs < last_ofs) /* only going forward */
@@ -689,16 +693,16 @@ int RGWObjManifest::generator::create_next(uint64_t ofs)
 
   uint64_t max_head_size = manifest->get_max_head_size();
 
-  if (ofs <= max_head_size) {
+  if (ofs <= max_head_size) {//这个情况发生在写olh的时候
     manifest->set_head_size(ofs);
   }
 
-  if (ofs >= max_head_size) {
+  if (ofs >= max_head_size) {//写tail
     manifest->set_head_size(max_head_size);
-    cur_stripe = (ofs - max_head_size) / rule.stripe_max_size;
+    cur_stripe = (ofs - max_head_size) / rule.stripe_max_size;//计算在第几个分片，先要减去olh的512K，再除以4M
     cur_stripe_size =  rule.stripe_max_size;
 
-    if (cur_part_id == 0 && max_head_size > 0) {
+    if (cur_part_id == 0 && max_head_size > 0) {//写的是第一个part而且max_head_size>0,这时其实就是非multipart。由于olh相当于占了一个分片，上面计算的时候已经减去，所以需要++
       cur_stripe++;
     }
   }
@@ -1044,7 +1048,7 @@ int RGWPutObjProcessor_Aio::throttle_data(void *handle, bool need_to_wait)
 
 int RGWPutObjProcessor_Atomic::write_data(bufferlist& bl, off_t ofs, void **phandle, bool exclusive)
 {
-  if (ofs >= next_part_ofs) {
+  if (ofs >= next_part_ofs) {//分片写完了，取下一个分片来写
     int r = prepare_next_part(ofs);
     if (r < 0) {
       return r;
@@ -1074,24 +1078,25 @@ int RGWPutObjProcessor_Atomic::handle_data(bufferlist& bl, off_t ofs, MD5 *hash,
     }
   }
 
+  //每次都写max_chunk_size大小的数据，一直写至这一个分片的边界（next_part_ofs），最后一块可能小于max_chunk_size，那就取next_part_ofs - data_ofs，以保证每个分片是4M
   uint64_t max_write_size = MIN(max_chunk_size, (uint64_t)next_part_ofs - data_ofs);
 
-  pending_data_bl.claim_append(bl);
-  if (pending_data_bl.length() < max_write_size)
+  pending_data_bl.claim_append(bl);//pending_data_bl将appendbl，而bl清空
+  if (pending_data_bl.length() < max_write_size)//pending_data_bl长度已经小于max_write_size了，由后面的complete_writing_data再去处理最后的尾部数据
     return 0;
 
-  pending_data_bl.splice(0, max_write_size, &bl);
+  pending_data_bl.splice(0, max_write_size, &bl);//将pending_data_bl切其开头的max_write_size给bl
 
   /* do we have enough data pending accumulated that needs to be written? */
-  *again = (pending_data_bl.length() >= max_chunk_size);
+  *again = (pending_data_bl.length() >= max_chunk_size);//pending_data_bl长度大于max_write_size，等下还要回来处理
 
-  if (!data_ofs && !immutable_head()) {
+  if (!data_ofs && !immutable_head()) {//非multipart的第一块即olh（multipart头不变）
     first_chunk.claim(bl);
     obj_len = (uint64_t)first_chunk.length();
     if (hash) {
       hash->Update((const byte *)first_chunk.c_str(), obj_len);
     }
-    int r = prepare_next_part(obj_len);
+    int r = prepare_next_part(obj_len);//olh分片处理完毕，去下一个分片
     if (r < 0) {
       return r;
     }
@@ -1102,7 +1107,7 @@ int RGWPutObjProcessor_Atomic::handle_data(bufferlist& bl, off_t ofs, MD5 *hash,
   data_ofs = write_ofs + bl.length();
   bool exclusive = (!write_ofs && immutable_head()); /* immutable head object, need to verify nothing exists there
                                                         we could be racing with another upload, to the same
-                                                        object and cleanup can be messy */
+                                                        object and cleanup can be messy *///第一次的multipart写需要排他，防止与其他上传竞争
   int ret = write_data(bl, write_ofs, phandle, exclusive);
   if (ret >= 0) { /* we might return, need to clear bl as it was already sent */
     if (hash) {
@@ -1122,7 +1127,7 @@ void RGWPutObjProcessor_Atomic::complete_hash(MD5 *hash)
 int RGWPutObjProcessor_Atomic::prepare_init(RGWRados *store, string *oid_rand)
 {
   RGWPutObjProcessor::prepare(store, oid_rand);
-
+//获取max_chunk_size，默认为512k
   int r = store->get_max_chunk_size(bucket, &max_chunk_size);
   if (r < 0) {
     return r;
@@ -1144,7 +1149,7 @@ int RGWPutObjProcessor_Atomic::prepare(RGWRados *store, string *oid_rand)
   } else if (versioned_object) {
     store->gen_rand_obj_instance_name(&head_obj);
   }
-
+  //设置非multipart的rule0，其"start_part_num": 0,"start_ofs": 524288,"part_size": 0,"stripe_max_size": 4194304,"override_prefix": ""
   manifest.set_trivial_rule(max_chunk_size, store->ctx()->_conf->rgw_obj_stripe_size);
 
   r = manifest_gen.create_begin(store->ctx(), &manifest, bucket, head_obj);
@@ -1183,7 +1188,7 @@ int RGWPutObjProcessor_Atomic::complete_writing_data()
     first_chunk.claim(pending_data_bl);
     obj_len = (uint64_t)first_chunk.length();
   }
-  if (pending_data_bl.length()) {
+  if (pending_data_bl.length()) {//处理最后小于512k的数据
     void *handle;
     int r = write_data(pending_data_bl, data_ofs, &handle, false);
     if (r < 0) {
@@ -1196,7 +1201,7 @@ int RGWPutObjProcessor_Atomic::complete_writing_data()
       return r;
     }
   }
-  int r = complete_parts();
+  int r = complete_parts();//目的其实是将cur_part_ofs移到当前对象长度
   if (r < 0) {
     return r;
   }
@@ -3005,7 +3010,7 @@ int RGWRados::create_pools(vector<string>& names, vector<int>& retcodes)
   return 0;
 }
 
-
+//与下面类似：主要是获取
 int RGWRados::get_obj_ioctx(const rgw_obj& obj, librados::IoCtx *ioctx)
 {
   rgw_bucket bucket;
@@ -3609,7 +3614,7 @@ int RGWRados::aio_put_obj_data(void *ctx, rgw_obj& obj, bufferlist& bl,
   
   ObjectWriteOperation op;
 
-  if (exclusive)
+  if (exclusive)//设置排他创建标志，即存在时再创建会出错
     op.create(true);
 
   if (ofs == -1) {
@@ -5425,7 +5430,7 @@ int RGWRados::Object::Read::prepare(int64_t *pofs, int64_t *pend)
 
   state.obj = astate->obj;
 
-  r = store->get_obj_ioctx(state.obj, &state.io_ctx);
+  r = store->get_obj_ioctx(state.obj, &state.io_ctx);//这一步其实可以在get_state的时候就已经获取到了ioctx吧？？
   if (r < 0) {
     return r;
   }
@@ -5459,7 +5464,7 @@ int RGWRados::Object::Read::prepare(int64_t *pofs, int64_t *pend)
       }
     }
   }
-  if (conds.if_match || conds.if_nomatch) {
+  if (conds.if_match || conds.if_nomatch) {//检查ifmatch，与etag对比
     r = get_attr(RGW_ATTR_ETAG, etag);
     if (r < 0)
       return r;
@@ -6206,7 +6211,7 @@ int RGWRados::Object::Read::iterate(int64_t ofs, int64_t end, RGWGetDataCB *cb)
   data->rados = store;
   data->io_ctx.dup(state.io_ctx);
   data->client_cb = cb;
-
+  //从ofs到end，一个分片一个分片地读
   int r = store->iterate_obj(obj_ctx, state.obj, ofs, end, cct->_conf->rgw_get_obj_max_req_size, _get_obj_iterate_cb, (void *)data);
   if (r < 0) {
     data->cancel_all_io();
@@ -6232,7 +6237,7 @@ done:
   data->put();
   return r;
 }
-
+//从ofs到end，一个分片一个分片地读
 int RGWRados::iterate_obj(RGWObjectCtx& obj_ctx, rgw_obj& obj,
                           off_t ofs, off_t end,
 			  uint64_t max_chunk_size,
@@ -7051,13 +7056,13 @@ int RGWRados::raw_obj_stat(rgw_obj& obj, uint64_t *psize, time_t *pmtime, uint64
     objv_tracker->prepare_op_for_read(&op);
   }
   if (attrs) {
-    op.getxattrs(&unfiltered_attrset, NULL);
+    op.getxattrs(&unfiltered_attrset, NULL);//获取属性
   }
   if (psize || pmtime) {
     op.stat(&size, &mtime, NULL);
   }
   if (first_chunk) {
-    op.read(0, cct->_conf->rgw_max_chunk_size, first_chunk, NULL);
+    op.read(0, cct->_conf->rgw_max_chunk_size, first_chunk, NULL);//读取第一块
   }
   bufferlist outbl;
   r = ref.ioctx.operate(ref.oid, &op, &outbl);//执行操作

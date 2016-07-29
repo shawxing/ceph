@@ -156,6 +156,7 @@ req_state::req_state(CephContext *_cct, class RGWEnv *e) : cct(_cct), cio(NULL),
   formatter = NULL;
   bucket_acl = NULL;
   object_acl = NULL;
+  bucket_policy = NULL;
   expect_cont = false;
 
   header_ended = false;
@@ -182,6 +183,7 @@ req_state::~req_state() {
   delete formatter;
   delete bucket_acl;
   delete object_acl;
+  delete bucket_policy;
 }
 
 struct str_len {

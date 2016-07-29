@@ -84,7 +84,7 @@ enum {
 /** @endcond */
 
 #if __GNUC__ >= 4
-  #define CEPH_RADOS_API  __attribute__ ((visibility ("default")))
+  #define CEPH_RADOS_API  __attribute__ ((visibility ("default")))//默认编译加-fvisibility=hidden选项，即所有符号隐藏，除了加了此属性的类或者函数
 #else
   #define CEPH_RADOS_API
 #endif

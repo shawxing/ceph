@@ -178,6 +178,10 @@ bool JSONObj::is_array()
   return (data.type() == array_type);
 }
 
+Value_type JSONObj::get_data_type(){
+	return data.type();
+}
+
 vector<string> JSONObj::get_array_elements()
 {
   vector<string> elements;
@@ -191,7 +195,10 @@ vector<string> JSONObj::get_array_elements()
     for (int i = 0; i < array_size; i++) {
       Value temp_value = temp_array[i];
       string temp_string;
-      temp_string = write(temp_value, raw_utf8);
+      if(temp_value.type() == str_type)
+    	  temp_string = temp_value.get_str();
+      else
+    	  temp_string = write(temp_value, raw_utf8);
       elements.push_back(temp_string);
     }
 
