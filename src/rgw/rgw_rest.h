@@ -10,7 +10,6 @@
 #include "rgw_op.h"
 #include "rgw_formats.h"
 
-
 extern std::map<std::string, std::string> rgw_to_http_attrs;
 
 extern string lowercase_dash_http_attr(const string& orig);

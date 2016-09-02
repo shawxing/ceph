@@ -1731,6 +1731,8 @@ int RGWInitMultipart_ObjStore_S3::get_params()
 
   policy = s3policy;
 
+//  server_encryption = s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION");
+
   return 0;
 }
 

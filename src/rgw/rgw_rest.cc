@@ -828,6 +828,7 @@ int RGWPutObj_ObjStore::verify_params()
 int RGWPutObj_ObjStore::get_params()
 {
   supplied_md5_b64 = s->info.env->get("HTTP_CONTENT_MD5");
+  server_encryption = s->info.env->get("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION");
 
   return 0;
 }
@@ -853,6 +854,7 @@ int RGWPutObj_ObjStore::get_data(bufferlist& bl)
     len = read_len;
     if (r < 0)
       return r;
+
     bl.append(bp, 0, len);
   }
 

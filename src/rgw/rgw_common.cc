@@ -201,7 +201,7 @@ struct str_len meta_prefixes[] = { STR_LEN_ENTRY("HTTP_X_AMZ"),
                                    STR_LEN_ENTRY("HTTP_X_CONTAINER"),
                                    {NULL, 0} };
 
-
+//将env里面以meta_prefixes为前缀的头部放进x_meta_map里面
 void req_info::init_meta_info(bool *found_bad_meta)
 {
   x_meta_map.clear();

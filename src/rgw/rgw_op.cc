@@ -28,6 +28,8 @@
 
 #include "rgw_client_io.h"
 
+#include <inttypes.h>
+#include <math.h>
 #define dout_subsys ceph_subsys_rgw
 
 using namespace std;
@@ -163,7 +165,7 @@ static void rgw_get_request_metadata(CephContext *cct,
       string attr_name(RGW_ATTR_PREFIX);
       attr_name.append(name);
       map<string, bufferlist>::value_type v(attr_name, bufferlist());
-      std::pair < map<string, bufferlist>::iterator, bool > rval(attrs.insert(v));
+      std::pair < map<string, bufferlist>::iterator, bool > rval(attrs.insert(v));//insert后的返回值
       bufferlist& bl(rval.first->second);
       bl.append(xattr.c_str(), xattr.size() + 1);
     }
@@ -916,15 +918,71 @@ int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
 {
   /* garbage collection related handling */
   utime_t start_time = ceph_clock_now(s->cct);
+  int r;
   if (start_time > gc_invalidate_time) {
-    int r = store->defer_gc(s->obj_ctx, obj);
+    r = store->defer_gc(s->obj_ctx, obj);
     if (r < 0) {
       dout(0) << "WARNING: could not defer gc entry for obj" << dendl;
     }
     gc_invalidate_time = start_time;
     gc_invalidate_time += (s->cct->_conf->rgw_gc_obj_min_wait / 2);
   }
-  return send_response_data(bl, bl_ofs, bl_len);
+
+	if (need_decryption && bl_len>0) {
+		bufferptr destptr(bl_len + 30);
+		int delen = 0 ;
+		int finallen = 0;
+		int send = send_count;
+		off_t send_ofs = 0;
+		off_t send_len = 0;
+
+		send_count += bl_len;
+		ldout(s->cct, 0) << "before EVP_DecryptUpdate="<< bl.c_str() << "bl_ofs=" << bl_ofs << " bl_len="<< bl_len<<dendl;
+		r = EVP_DecryptUpdate(&ctx, (unsigned char*)destptr.c_str(), &delen, (unsigned char*)(bl.c_str()+bl_ofs),bl_len);
+		if (r < 0)
+			return -1;
+		send_len = delen;
+
+		ldout(s->cct, 0) << "send_count=" << send_count << " evp_total=" << evp_total << " bl_len="<< bl_len <<" delen="<< delen<< "destptr.c_str()=" << destptr.c_str() <<dendl;
+
+		if (send_count == evp_total) {
+			ldout(s->cct, 0) << "before EVP_DecryptFinal_ex"<<dendl;
+			if(!need_padding){
+				bufferptr dp(16);
+				r = EVP_DecryptUpdate(&ctx, (unsigned char*)destptr.c_str() + delen, &delen, (unsigned char*)dp.c_str(), 1);
+				if (r < 0)
+					return -1;
+				send_len += delen;
+				ldout(s->cct, 0) << "needpadding update="<< destptr.c_str() <<dendl;
+			}
+
+			r = EVP_DecryptFinal_ex(&ctx, (unsigned char*)(destptr.c_str() + delen), &finallen);
+			EVP_CIPHER_CTX_cleanup(&ctx);
+			if (r < 0)
+				return -1;
+			send_len += finallen;
+			if(!need_padding)
+				send_len -= encrypt_end_ofs;
+		}
+
+		ldout(s->cct, 0) << "send_len=" << send_len << " finallen=" << finallen <<" encrypt_end_ofs="<< encrypt_end_ofs<<dendl;
+
+		if (send_len > 0) {
+			if (!send)
+				send_ofs = encrypt_start_ofs;
+
+			bufferlist debl;
+			debl.append(destptr);
+
+			ldout(s->cct, 0) << "send_ofs=" << send_ofs <<dendl;
+
+			return send_response_data(debl, send_ofs, send_len);
+		}
+	}
+	else
+		return send_response_data(bl, bl_ofs, bl_len);
+
+	return 0;
 }
 
 void RGWGetObj::pre_exec()
@@ -945,6 +1003,7 @@ void RGWGetObj::execute()
 
   perfcounter->inc(l_rgw_get);
   int64_t new_ofs, new_end;
+  int64_t encrypt_start, encrypt_end;
 
   RGWRados::Object op_target(store, s->bucket_info, *(RGWObjectCtx *)s->obj_ctx, obj);
   RGWRados::Object::Read read_op(&op_target);
@@ -993,7 +1052,47 @@ void RGWGetObj::execute()
 
   perfcounter->inc(l_rgw_get_b, end - ofs);
 
-  ret = read_op.iterate(ofs, end, &cb);
+  attr_iter = attrs.find(RGW_ATTR_PREFIX "x-amz-server-side-encryption");
+	if (attr_iter != attrs.end()) {
+		need_decryption = true;
+		attr_iter = attrs.find(RGW_ATTR_EVP_AES256_KEY);
+		assert(attr_iter != attrs.end());
+		strncpy((char *) evp_aes256_key, attr_iter->second.c_str(),
+				RGW_EVP_AES256_KEY_LENGTH);
+		EVP_CIPHER_CTX_init(&ctx);
+		int r = EVP_DecryptInit_ex(&ctx, EVP_aes_256_ecb(), NULL, evp_aes256_key, NULL);
+		if (r != 1)
+			goto done_err;
+
+		encrypt_start = (int64_t)floor(((double)ofs+1)/(double)RGW_EVP_AES256_CHUNK_LENGTH)*RGW_EVP_AES256_CHUNK_LENGTH-1;
+		if (encrypt_start < 0)
+			encrypt_start = 0;
+		encrypt_start_ofs = ofs - encrypt_start;
+
+		encrypt_end =  (int64_t)ceil(((double)end+1)/(double)RGW_EVP_AES256_CHUNK_LENGTH)*RGW_EVP_AES256_CHUNK_LENGTH-1;
+		if ((uint64_t)encrypt_end > s->obj_size - 1) {
+			need_padding = true;
+			encrypt_end = s->obj_size - 1;
+		}
+		encrypt_end_ofs = encrypt_end - end;
+
+		evp_total = encrypt_end + 1 - encrypt_start;
+    if(need_padding){
+			attr_iter = attrs.find(RGW_ATTR_EVP_AES256_PADDING);
+			if (attr_iter == attrs.end())
+				goto done_err;
+			evp_total += attr_iter->second.length();
+    }
+
+		ret = read_op.iterate(encrypt_start, encrypt_end, &cb);
+
+		if (need_padding) {
+			get_data_cb(attr_iter->second, 0, attr_iter->second.length());
+		}
+	}
+  else{
+  	 ret = read_op.iterate(ofs, end, &cb);
+  }
 
   perfcounter->tinc(l_rgw_get_lat,
                    (ceph_clock_now(s->cct) - start_time));
@@ -1762,6 +1861,53 @@ static int get_system_versioning_params(req_state *s, uint64_t *olh_epoch, strin
   return 0;
 }
 
+int RGWPutObj::encrypt_init(bool muiltipart)
+{
+	map<string, bufferlist> oldattrs;
+
+	rgw_obj obj(s->bucket,s->object);
+
+	if(muiltipart){
+		//multipart server side encryption imcomplete
+//			RGWMPObj mp;
+//			string meta_oid;
+//	  	mp.init(s->object.name, s->info.args.get("uploadId"));
+//	  	meta_oid = mp.get_meta();
+//	  	obj.init_ns(s->bucket, meta_oid, mp_ns);
+//	  	obj.set_in_extra_data(true);
+//	  	obj.index_hash_source = s->object.name;
+//
+//		  RGWRados::Object op_target(store, s->bucket_info, *(RGWObjectCtx *)s->obj_ctx, obj);
+//		  RGWRados::Object::Read read_op(&op_target);
+//
+//		  read_op.params.attrs = &oldattrs;
+//		  read_op.params.perr = &s->err;
+//
+//		if (read_op.prepare(NULL, NULL) >= 0) {
+//			map<string, bufferlist>::iterator iter = oldattrs.find(RGW_ATTR_PREFIX "x-amz-server-side-encryption");
+//			if (iter != oldattrs.end() && !strcmp(iter->second.c_str(), "AES256")) {
+//				need_encryption = true;
+//				map<string, bufferlist>::iterator iterkey = oldattrs.find(RGW_ATTR_EVP_AES256_KEY);
+//				strncpy((char *)evp_aes256_key, iterkey->second.c_str(), EVP_AES256_KEY_LENGTH);
+//			}
+//		}
+	}
+	else if (server_encryption && strcmp(server_encryption, "AES256") == 0) {
+		need_encryption = true;
+		if (!RAND_bytes(evp_aes256_key, RGW_EVP_AES256_KEY_LENGTH))
+			return -1;
+	}
+
+	if (need_encryption) {
+		EVP_CIPHER_CTX_init(&ctx);
+		ret = EVP_EncryptInit_ex(&ctx, EVP_aes_256_ecb(), NULL, evp_aes256_key,NULL);
+		if (ret != 1)
+			return -1;
+	}
+
+	return 0;
+}
+
 void RGWPutObj::execute()
 {
   RGWPutObjProcessor *processor = NULL;
@@ -1773,11 +1919,13 @@ void RGWPutObj::execute()
   bufferlist bl, aclbl;
   map<string, bufferlist> attrs;
   int len;
+	int r;
   map<string, string>::iterator iter;
   bool multipart;
 
-  bool need_calc_md5 = (obj_manifest == NULL);
+  bufferlist key;
 
+  bool need_calc_md5 = (obj_manifest == NULL);
 
   perfcounter->inc(l_rgw_put);
   ret = -EINVAL;
@@ -1829,6 +1977,11 @@ void RGWPutObj::execute()
 
   processor = select_processor(*(RGWObjectCtx *)s->obj_ctx, &multipart);
 
+  ret = encrypt_init(multipart);
+  if(ret < 0)
+  	goto done;
+  ldout(s->cct, 15) << "needencryption=" << need_encryption << dendl;
+
   ret = processor->prepare(store, NULL);
   if (ret < 0)
     goto done;
@@ -1840,8 +1993,43 @@ void RGWPutObj::execute()
       ret = len;
       goto done;
     }
-    if (!len)
-      break;
+
+		bufferptr enbp(len + 16);
+		int encrypt_len;
+		if (!len) {
+			if (need_encryption) {
+				int leftlen = ctx.buf_len;
+				r = EVP_EncryptFinal_ex(&ctx, (unsigned char *) enbp.c_str(),&encrypt_len);
+				EVP_CIPHER_CTX_cleanup(&ctx);
+				if (r < 0)
+					goto done;
+				if (leftlen > 0 && encrypt_len >= leftlen) {
+					data.clear();
+					data.append(enbp, 0, leftlen);
+					evp_padding.append(enbp, leftlen, encrypt_len - leftlen);
+				} else
+					break;
+			} else
+				break;
+		} else {
+			if (need_calc_md5) {
+				hash.Update((const byte *) data.c_str(), data.length());
+			}
+
+			if (need_encryption) {
+				r = EVP_EncryptUpdate(&ctx, (unsigned char *) enbp.c_str(),&encrypt_len, (unsigned char *) data.c_str(), len);
+				if (r < 0)
+					goto done;
+
+				if (encrypt_len > 0) {
+					data.clear();
+					data.append(enbp, 0, encrypt_len);
+				} else if (encrypt_len == 0) { //when read_len+ctx.buf_len<16
+					ofs += len;
+					continue;
+				}
+			}
+		}
 
     /* do we need this operation to be synchronous? if we're dealing with an object with immutable
      * head, e.g., multipart object we need to make sure we're the first one writing to this object
@@ -1883,7 +2071,7 @@ void RGWPutObj::execute()
         goto done;
       }
 
-      ret = put_data_and_throttle(processor, data, ofs, NULL, false);
+      ret = put_data_and_throttle(processor, data, ofs, NULL,false);
       if (ret < 0) {
         goto done;
       }
@@ -1906,7 +2094,7 @@ void RGWPutObj::execute()
   }
 
   if (need_calc_md5) {
-    processor->complete_hash(&hash);//最后一部分数据计算hash，这个地方我觉得应该等写完再计算吧？
+//    processor->complete_hash(&hash);//最后一部分数据计算hash，这个地方我觉得应该等写完再计算吧？
     hash.Final(m);
 
     buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
@@ -1921,6 +2109,7 @@ void RGWPutObj::execute()
   policy.encode(aclbl);
 
   attrs[RGW_ATTR_ACL] = aclbl;
+
   if (obj_manifest) {
     bufferlist manifest_bl;
     string manifest_obj_prefix;
@@ -1964,7 +2153,14 @@ void RGWPutObj::execute()
 
   rgw_get_request_metadata(s->cct, s->info, attrs);//x-amz-date属性
 
-  ret = processor->complete(etag, &mtime, 0, attrs, if_match, if_nomatch);
+  if(need_encryption){
+	  if(evp_padding.length() > 0)
+		  attrs[RGW_ATTR_EVP_AES256_PADDING] = evp_padding;
+	  key.append((const char*)evp_aes256_key,RGW_EVP_AES256_KEY_LENGTH);
+	  attrs[RGW_ATTR_EVP_AES256_KEY] = key;
+  }
+
+  ret = processor->complete(etag, &mtime, 0, attrs, if_match, if_nomatch);//写firstchunk和属性
 done:
   dispose_processor(processor);
   perfcounter->tinc(l_rgw_put_lat,
@@ -2898,6 +3094,16 @@ void RGWInitMultipart::execute()
 
   rgw_get_request_metadata(s->cct, s->info, attrs);
 
+  //multipatr server encryption imcomplete
+//	if (server_encryption && strcmp(server_encryption, "AES256") == 0) {
+//		if (!RAND_bytes(evp_aes256_key, EVP_AES256_KEY_LENGTH))
+//			return;
+//
+//		bufferlist key;
+//		key.append((const char*) evp_aes256_key, EVP_AES256_KEY_LENGTH);
+//		attrs[RGW_ATTR_EVP_AES256_KEY] = key;
+//	}
+
   do {
     char buf[33];
     gen_rand_alphanumeric(s->cct, buf, sizeof(buf) - 1);
@@ -2921,6 +3127,8 @@ void RGWInitMultipart::execute()
     obj_op.meta.owner = s->owner.get_id();
     obj_op.meta.category = RGW_OBJ_CATEGORY_MULTIMETA;
     obj_op.meta.flags = PUT_OBJ_CREATE_EXCL;
+
+    ldout(s->cct, 0) << "Initmuiltipart obj" << obj << dendl;
 
     ret = obj_op.write_meta(0, attrs);
   } while (ret == -EEXIST);

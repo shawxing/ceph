@@ -25,6 +25,10 @@
 #include "rgw_cors.h"
 #include "rgw_quota.h"
 
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+
 using namespace std;
 
 struct req_state;
@@ -116,6 +120,15 @@ public:
 };
 
 class RGWGetObj : public RGWOp {
+private:
+	bool need_decryption;
+  unsigned char evp_aes256_key[RGW_EVP_AES256_KEY_LENGTH];
+  EVP_CIPHER_CTX ctx;
+  off_t encrypt_start_ofs;
+  off_t encrypt_end_ofs;
+  uint64_t send_count;
+  uint64_t evp_total;
+  bool need_padding;
 protected:
   const char *range_str;
   const char *if_mod;
@@ -158,6 +171,12 @@ public:
     get_data = false;
     partial_content = false;
     ret = 0;
+    need_decryption = false;
+    need_padding = false;
+    encrypt_start_ofs = 0;
+    encrypt_end_ofs = 0;
+    send_count = 0 ;
+    evp_total = 0;
  }
 
   virtual bool prefetch_data() { return get_data; }
@@ -412,6 +431,7 @@ protected:
   const char *supplied_etag;
   const char *if_match;
   const char *if_nomatch;
+  const char *server_encryption;
   string etag;
   bool chunked_upload;
   RGWAccessControlPolicy policy;
@@ -423,11 +443,17 @@ protected:
   uint64_t olh_epoch;
   string version_id;
 
+  unsigned char evp_aes256_key[RGW_EVP_AES256_KEY_LENGTH];
+  EVP_CIPHER_CTX ctx;
+  bool need_encryption;
+  bufferlist evp_padding;
+
 public:
   RGWPutObj() {
     ret = 0;
     ofs = 0;
     supplied_md5_b64 = NULL;
+    server_encryption = NULL;
     supplied_etag = NULL;
     if_match = NULL;
     if_nomatch = NULL;
@@ -436,6 +462,7 @@ public:
     mtime = 0;
     user_manifest_parts_hash = NULL;
     olh_epoch = 0;
+    need_encryption = false;
   }
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
@@ -451,6 +478,7 @@ public:
   void execute();
 
   virtual int get_params() = 0;
+  int encrypt_init(bool muiltipart);
   virtual int get_data(bufferlist& bl) = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "put_obj"; }
@@ -656,7 +684,10 @@ protected:
 	char *data;
 
 public:
-	RGWPutPolicy():ret(0),len(0),data(NULL){};
+	RGWPutPolicy():ret(0),len(0),data(NULL){}
+  virtual	~RGWPutPolicy(){
+		free(data);
+	}
 
 	int verify_permission();
 	void pre_exec();
@@ -699,7 +730,7 @@ protected:
 	size_t len;
 
 public:
-	RGWDeletePolicy():ret(0),len(0){};
+	RGWDeletePolicy():ret(0),len(0){}
 
 	int verify_permission();
 	void pre_exec(){};
@@ -844,9 +875,14 @@ protected:
   string upload_id;
   RGWAccessControlPolicy policy;
 
+//  const char *server_encryption;
+//
+//  unsigned char evp_aes256_key[RGW_EVP_AES256_KEY_LENGTH];
+
 public:
   RGWInitMultipart() {
     ret = 0;
+//    server_encryption = NULL;
   }
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {

@@ -71,6 +71,8 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_SHADOW_OBJ    	RGW_ATTR_PREFIX "shadow_name"
 #define RGW_ATTR_MANIFEST    	RGW_ATTR_PREFIX "manifest"
 #define RGW_ATTR_USER_MANIFEST  RGW_ATTR_PREFIX "user_manifest"
+#define RGW_ATTR_EVP_AES256_PADDING	RGW_ATTR_PREFIX "evp_aes256_padding"
+#define RGW_ATTR_EVP_AES256_KEY RGW_ATTR_PREFIX "evp_aes256_key"
 
 #define RGW_ATTR_OLH_PREFIX     RGW_ATTR_PREFIX "olh."
 
@@ -80,6 +82,9 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_OLH_PENDING_PREFIX RGW_ATTR_OLH_PREFIX "pending."
 
 #define RGW_BUCKETS_OBJ_SUFFIX ".buckets"
+
+#define RGW_EVP_AES256_KEY_LENGTH 32
+#define RGW_EVP_AES256_CHUNK_LENGTH 16
 
 #define RGW_MAX_PENDING_CHUNKS  16
 #define RGW_MIN_MULTIPART_SIZE (5ULL*1024*1024)

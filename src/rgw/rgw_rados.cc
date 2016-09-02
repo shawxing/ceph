@@ -1093,9 +1093,9 @@ int RGWPutObjProcessor_Atomic::handle_data(bufferlist& bl, off_t ofs, MD5 *hash,
   if (!data_ofs && !immutable_head()) {//非multipart的第一块即olh（multipart头不变）
     first_chunk.claim(bl);
     obj_len = (uint64_t)first_chunk.length();
-    if (hash) {
-      hash->Update((const byte *)first_chunk.c_str(), obj_len);
-    }
+//    if (hash) {
+//      hash->Update((const byte *)first_chunk.c_str(), obj_len);
+//    }
     int r = prepare_next_part(obj_len);//olh分片处理完毕，去下一个分片
     if (r < 0) {
       return r;
@@ -1108,19 +1108,21 @@ int RGWPutObjProcessor_Atomic::handle_data(bufferlist& bl, off_t ofs, MD5 *hash,
   bool exclusive = (!write_ofs && immutable_head()); /* immutable head object, need to verify nothing exists there
                                                         we could be racing with another upload, to the same
                                                         object and cleanup can be messy *///第一次的multipart写需要排他，防止与其他上传竞争
+//  if (hash) {
+//    hash->Update((const byte *)bl.c_str(), bl.length());
+//  }
+
   int ret = write_data(bl, write_ofs, phandle, exclusive);
   if (ret >= 0) { /* we might return, need to clear bl as it was already sent */
-    if (hash) {
-      hash->Update((const byte *)bl.c_str(), bl.length());
-    }
-    bl.clear();
+	  bl.clear();
   }
+
   return ret;
 }
 
 void RGWPutObjProcessor_Atomic::complete_hash(MD5 *hash)
 {
-  hash->Update((const byte *)pending_data_bl.c_str(), pending_data_bl.length());
+//  hash->Update((const byte *)pending_data_bl.c_str(), pending_data_bl.length());
 }
 
 
@@ -7079,7 +7081,7 @@ int RGWRados::raw_obj_stat(rgw_obj& obj, uint64_t *psize, time_t *pmtime, uint64
   if (pmtime)
     *pmtime = mtime;
   if (attrs) {
-    filter_attrset(unfiltered_attrset, RGW_ATTR_PREFIX, attrs);//加前缀
+    filter_attrset(unfiltered_attrset, RGW_ATTR_PREFIX, attrs);//检查前缀，过滤没有以RGW_ATTR_PREFIX开头的属性
   }
 
   return 0;
