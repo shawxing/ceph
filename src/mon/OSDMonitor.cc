@@ -16,6 +16,7 @@
  * 
  */
 
+#include <algorithm>
 #include <sstream>
 
 #include "OSDMonitor.h"
@@ -461,21 +462,39 @@ void OSDMonitor::update_logger()
   mon->cluster_logger->set(l_cluster_osd_epoch, osdmap.get_epoch());
 }
 
+struct Sorter {
+
+    double average_util; 
+
+    Sorter(const double average_util_)
+     : average_util(average_util_)
+    {}
+
+    bool operator()(std::pair<int,float> l, std::pair<int,float> r) {
+        return abs(l.second - average_util) > abs(r.second - average_util);
+    }
+};
+
 /* Assign a lower weight to overloaded OSDs.
  *
  * The osds that will get a lower weight are those with with a utilization
  * percentage 'oload' percent greater than the average utilization.
  */
-int OSDMonitor::reweight_by_utilization(int oload, std::string& out_str,
-					bool by_pg, const set<int64_t> *pools)
+int OSDMonitor::reweight_by_utilization(int oload,
+					double max_changef,
+					int max_osds,
+					bool by_pg, const set<int64_t> *pools,
+					bool no_increasing,
+					bool dry_run,
+					std::stringstream *ss,
+					std::string *out_str,
+					Formatter *f)
 {
   if (oload <= 100) {
-    ostringstream oss;
-    oss << "You must give a percentage higher than 100. "
+    *ss << "You must give a percentage higher than 100. "
       "The reweighting threshold will be calculated as <average-utilization> "
       "times <input-percentage>. For example, an argument of 200 would "
       "reweight OSDs which are twice as utilized as the average OSD.\n";
-    out_str = oss.str();
     return -EINVAL;
   }
 
@@ -511,10 +530,8 @@ int OSDMonitor::reweight_by_utilization(int oload, std::string& out_str,
     }
 
     if (!num_osds || (num_pg_copies / num_osds < g_conf->mon_reweight_min_pgs_per_osd)) {
-      ostringstream oss;
-      oss << "Refusing to reweight: we only have " << num_pg_copies
+      *ss << "Refusing to reweight: we only have " << num_pg_copies
 	  << " PGs across " << num_osds << " osds!\n";
-      out_str = oss.str();
       return -EDOM;
     }
 
@@ -525,17 +542,15 @@ int OSDMonitor::reweight_by_utilization(int oload, std::string& out_str,
     if ((uint64_t)pgm.osd_sum.kb * 1024 / num_osd
 	< g_conf->mon_reweight_min_bytes_per_osd) {
       ostringstream oss;
-      oss << "Refusing to reweight: we only have " << pgm.osd_sum.kb
+      *ss << "Refusing to reweight: we only have " << pgm.osd_sum.kb
 	  << " kb across all osds!\n";
-      out_str = oss.str();
       return -EDOM;
     }
     if ((uint64_t)pgm.osd_sum.kb_used * 1024 / num_osd
 	< g_conf->mon_reweight_min_bytes_per_osd) {
       ostringstream oss;
-      oss << "Refusing to reweight: we only have " << pgm.osd_sum.kb_used
+      *ss << "Refusing to reweight: we only have " << pgm.osd_sum.kb_used
 	  << " kb used across all osds!\n";
-      out_str = oss.str();
       return -EDOM;
     }
 
@@ -548,61 +563,129 @@ int OSDMonitor::reweight_by_utilization(int oload, std::string& out_str,
   // but aggressively adjust weights up whenever possible.
   double underload_util = average_util;
 
+  unsigned max_change = (unsigned)(max_changef * (double)0x10000);
+
   ostringstream oss;
-  char buf[128];
-  snprintf(buf, sizeof(buf), "average %04f, overload %04f. ",
-	   average_util, overload_util);
-  oss << buf;
-  std::string sep;
-  oss << "reweighted: ";
+  if (f) {
+    f->open_object_section("reweight_by_utilization");
+    f->dump_unsigned("overload_min", oload);
+    f->dump_float("max_change", max_changef);
+    f->dump_float("max_change_osds", max_osds);
+    f->dump_float("average_utilization", average_util);
+    f->dump_float("overload_utilization", overload_util);
+  } else {
+    oss << "oload " << oload << "\n";
+    oss << "max_change " << max_changef << "\n";
+    oss << "max_change_osds " << max_osds << "\n";
+    char buf[128];
+    snprintf(buf, sizeof(buf), "average %04f\noverload %04f\n",
+	     average_util, overload_util);
+    oss << buf;
+  }
   bool changed = false;
+  int num_changed = 0;
+
+  // precompute util for each OSD
+  std::vector<std::pair<int, float> > util_by_osd;
   for (ceph::unordered_map<int,osd_stat_t>::const_iterator p =
-	 pgm.osd_stat.begin();
+       pgm.osd_stat.begin();
        p != pgm.osd_stat.end();
        ++p) {
-    float util;
+    std::pair<int, float> osd_util;
+    osd_util.first = p->first;
     if (by_pg) {
-      util = pgs_by_osd[p->first] / osdmap.crush->get_item_weightf(p->first);
+      osd_util.second = pgs_by_osd[p->first] / osdmap.crush->get_item_weightf(p->first);
     } else {
-      util = (double)p->second.kb_used / (double)p->second.kb;
+      osd_util.second = (double)p->second.kb_used / (double)p->second.kb;
     }
+    util_by_osd.push_back(osd_util);
+  }
+
+  // sort by absolute deviation from the mean utilization,
+  // in descending order.
+  std::sort(util_by_osd.begin(), util_by_osd.end(), Sorter(average_util));
+
+  OSDMap::Incremental newinc;
+
+  if (f)
+    f->open_array_section("reweights");
+
+  for (std::vector<std::pair<int, float> >::const_iterator p =
+	 util_by_osd.begin();
+       p != util_by_osd.end();
+       ++p) {
+    float util = p->second;
+
     if (util >= overload_util) {
-      sep = ", ";
       // Assign a lower weight to overloaded OSDs. The current weight
       // is a factor to take into account the original weights,
       // to represent e.g. differing storage capacities
       unsigned weight = osdmap.get_weight(p->first);
       unsigned new_weight = (unsigned)((average_util / util) * (float)weight);
-      pending_inc.new_weight[p->first] = new_weight;
-      char buf[128];
-      snprintf(buf, sizeof(buf), "osd.%d [%04f -> %04f]", p->first,
-	       (float)weight / (float)0x10000,
-	       (float)new_weight / (float)0x10000);
-      oss << buf << sep;
-      changed = true;
+      if (weight > max_change)
+	new_weight = MAX(new_weight, weight - max_change);
+      newinc.new_weight[p->first] = new_weight;
+      if (!dry_run) {
+	pending_inc.new_weight[p->first] = new_weight;
+	changed = true;
+      }
+      if (f) {
+	f->open_object_section("osd");
+	f->dump_unsigned("osd", p->first);
+	f->dump_float("weight", (float)weight / (float)0x10000);
+	f->dump_float("new_weight", (float)new_weight / (float)0x10000);
+	f->close_section();
+      } else {
+	char buf[128];
+	snprintf(buf, sizeof(buf), "osd.%d weight %04f -> %04f\n", p->first,
+		 (float)weight / (float)0x10000,
+		 (float)new_weight / (float)0x10000);
+	oss << buf;
+      }
+      if (++num_changed >= max_osds)
+	break;
     }
-    if (util <= underload_util) {
+    if (!no_increasing && util <= underload_util) {
       // assign a higher weight.. if we can.
       unsigned weight = osdmap.get_weight(p->first);
       unsigned new_weight = (unsigned)((average_util / util) * (float)weight);
+      new_weight = MIN(new_weight, weight + max_change);
       if (new_weight > 0x10000)
 	new_weight = 0x10000;
       if (new_weight > weight) {
-	sep = ", ";
-	pending_inc.new_weight[p->first] = new_weight;
+	newinc.new_weight[p->first] = new_weight;
+	if (!dry_run) {
+	  pending_inc.new_weight[p->first] = new_weight;
+	  changed = true;
+	}
 	char buf[128];
-	snprintf(buf, sizeof(buf), "osd.%d [%04f -> %04f]", p->first,
+	snprintf(buf, sizeof(buf), "osd.%d weight %04f -> %04f\n", p->first,
 		 (float)weight / (float)0x10000,
 		 (float)new_weight / (float)0x10000);
-	oss << buf << sep;
-	changed = true;
+	oss << buf;
+	if (++num_changed >= max_osds)
+	  break;
       }
     }
   }
-  if (sep.empty()) {
-    oss << "(none)";
+  if (f) {
+    f->close_section();
   }
-  out_str = oss.str();
+
+  OSDMap newmap;
+  newmap.deepish_copy_from(osdmap);
+  newinc.fsid = newmap.fsid;
+  newinc.epoch = newmap.get_epoch() + 1;
+  newmap.apply_incremental(newinc);
+
+  osdmap.summarize_mapping_stats(&newmap, pools, out_str, f);
+
+  if (f) {
+    f->close_section();
+  } else {
+    *out_str += "\n";
+    *out_str += oss.str();
+  }
   dout(10) << "reweight_by_utilization: finished with " << out_str << dendl;
   return changed;
 }
@@ -1411,6 +1494,13 @@ void OSDMonitor::check_failures(utime_t now)
 
 bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 {
+  // already pending failure?
+  if (pending_inc.new_state.count(target_osd) &&
+      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
+    dout(10) << " already pending failure" << dendl;
+    return true;
+  }
+
   utime_t orig_grace(g_conf->osd_heartbeat_grace, 0);
   utime_t max_failed_since = fi.get_failed_since();
   utime_t failed_for = now - max_failed_since;
@@ -1453,13 +1543,6 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 	   << fi.num_reports << " reports, "
 	   << grace << " grace (" << orig_grace << " + " << my_grace << " + " << peer_grace << "), max_failed_since " << max_failed_since
 	   << dendl;
-
-  // already pending failure?
-  if (pending_inc.new_state.count(target_osd) &&
-      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
-    dout(10) << " already pending failure" << dendl;
-    return true;
-  }
 
   if (failed_for >= grace &&
       ((int)fi.reporters.size() >= g_conf->mon_osd_min_down_reporters) &&
@@ -1565,6 +1648,9 @@ void OSDMonitor::take_all_failures(list<MOSDFailure*>& ls)
   failure_info.clear();
 }
 
+static bool uses_gmt_hitset(const std::pair<int64_t, pg_pool_t>& pool) {
+  return pool.second.use_gmt_hitset;
+}
 
 // boot --
 
@@ -1630,6 +1716,19 @@ bool OSDMonitor::preprocess_boot(MOSDBoot *m)
       mon->clog->info() << "disallowing boot of pre-hammer OSD "
 			<< m->get_orig_source_inst()
 			<< " because all up OSDs are post-hammer\n";
+      goto ignore;
+    }
+  }
+
+  if (std::find_if(osdmap.get_pools().begin(),
+		   osdmap.get_pools().end(),
+		   uses_gmt_hitset) != osdmap.get_pools().end()) {
+    assert(osdmap.get_num_up_osds() == 0 ||
+	   osdmap.get_up_osd_features() & CEPH_FEATURE_OSD_HITSET_GMT);
+    if (!(m->osd_features & CEPH_FEATURE_OSD_HITSET_GMT)) {
+      dout(0) << __func__ << " one or more pools uses GMT hitsets but osd at "
+	      << m->get_orig_source_inst()
+	      << " doesn't announce support -- ignore" << dendl;
       goto ignore;
     }
   }
@@ -1932,6 +2031,21 @@ bool OSDMonitor::preprocess_pgtemp(MOSDPGTemp *m)
        */
       dout(10) << __func__ << " ignore " << p->first << " -> " << p->second
                << ": pool has been removed" << dendl;
+      ignore_cnt++;
+      continue;
+    }
+
+    int acting_primary = -1;
+    osdmap.pg_to_up_acting_osds(
+      p->first, NULL, NULL, NULL, &acting_primary);
+    if (acting_primary != from) {
+      /* If the source isn't the primary based on the current osdmap, we know
+       * that the interval changed and that we can discard this message.
+       * Indeed, we must do so to avoid 16127 since we can't otherwise determine
+       * which of two pg temp mappings on the same pg is more recent.
+       */
+      dout(10) << __func__ << " ignore " << p->first << " -> " << p->second
+	       << ": primary has changed" << dendl;
       ignore_cnt++;
       continue;
     }
@@ -2790,6 +2904,15 @@ bool OSDMonitor::preprocess_command(MMonCommand *m)
       ds << "max_osd = " << osdmap.get_max_osd() << " in epoch " << osdmap.get_epoch();
       rdata.append(ds);
     }
+  } else if (prefix == "osd utilization") {
+    string out;
+    osdmap.summarize_mapping_stats(NULL, NULL, &out, f.get());
+    if (f)
+      f->flush(rdata);
+    else
+      rdata.append(out);
+    r = 0;
+    goto reply;
   } else if (prefix  == "osd find") {
     int64_t osd;
     if (!cmd_getval(g_ceph_context, cmdmap, "id", osd)) {
@@ -3051,6 +3174,7 @@ bool OSDMonitor::preprocess_command(MMonCommand *m)
     if (!p->is_tier() &&
         (var == "hit_set_type" || var == "hit_set_period" ||
          var == "hit_set_count" || var == "hit_set_fpp" ||
+	 var == "use_gmt_hitset" ||
          var == "target_max_objects" || var == "target_max_bytes" ||
          var == "cache_target_full_ratio" ||
          var == "cache_target_dirty_ratio" ||
@@ -3103,6 +3227,8 @@ bool OSDMonitor::preprocess_command(MMonCommand *m)
 	  BloomHitSet::Params *bloomp = static_cast<BloomHitSet::Params*>(p->hit_set_params.impl.get());
 	  f->dump_float("hit_set_fpp", bloomp->get_fpp());
 	}
+      } else if (var == "use_gmt_hitset") {
+	f->dump_bool("use_gmt_hitset", p->use_gmt_hitset);
       } else if (var == "target_max_objects") {
         f->dump_unsigned("target_max_objects", p->target_max_objects);
       } else if (var == "target_max_bytes") {
@@ -3160,6 +3286,8 @@ bool OSDMonitor::preprocess_command(MMonCommand *m)
 	}
 	BloomHitSet::Params *bloomp = static_cast<BloomHitSet::Params*>(p->hit_set_params.impl.get());
 	ss << "hit_set_fpp: " << bloomp->get_fpp();
+      } else if (var == "use_gmt_hitset") {
+	ss << "use_gmt_hitset: " << p->use_gmt_hitset << "\n";
       } else if (var == "target_max_objects") {
         ss << "target_max_objects: " << p->target_max_objects;
       } else if (var == "target_max_bytes") {
@@ -3533,8 +3661,8 @@ void OSDMonitor::get_pools_health(
 	detail->push_back(make_pair(HEALTH_WARN, ss.str()));
     }
 
-    float warn_threshold = g_conf->mon_pool_quota_warn_threshold/100;
-    float crit_threshold = g_conf->mon_pool_quota_crit_threshold/100;
+    float warn_threshold = (float)g_conf->mon_pool_quota_warn_threshold/100;
+    float crit_threshold = (float)g_conf->mon_pool_quota_crit_threshold/100;
 
     if (pool.quota_max_objects > 0) {
       stringstream ss;
@@ -4042,6 +4170,11 @@ int OSDMonitor::prepare_new_pool(string& name, uint64_t auid,
     pi->set_flag(pg_pool_t::FLAG_NOPGCHANGE);
   if (g_conf->osd_pool_default_flag_nosizechange)
     pi->set_flag(pg_pool_t::FLAG_NOSIZECHANGE);
+  if (g_conf->osd_pool_use_gmt_hitset &&
+      (osdmap.get_up_osd_features() & CEPH_FEATURE_OSD_HITSET_GMT))
+    pi->use_gmt_hitset = true;
+  else
+    pi->use_gmt_hitset = false;
 
   pi->size = size;
   pi->min_size = min_size;
@@ -4385,6 +4518,17 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
     }
     BloomHitSet::Params *bloomp = static_cast<BloomHitSet::Params*>(p.hit_set_params.impl.get());
     bloomp->set_fpp(f);
+  } else if (var == "use_gmt_hitset") {
+    if (val == "true" || (interr.empty() && n == 1)) {
+      if (!(osdmap.get_up_osd_features() & CEPH_FEATURE_OSD_HITSET_GMT)) {
+	ss << "not all OSDs support GMT hit set.";
+	return -EINVAL;
+      }
+      p.use_gmt_hitset = true;
+    } else {
+      ss << "expecting value 'true' or '1'";
+      return -EINVAL;
+    }
   } else if (var == "debug_fake_ec_pool") {
     if (val == "true" || (interr.empty() && n == 1)) {
       p.flags |= pg_pool_t::FLAG_DEBUG_FAKE_EC_POOL;
@@ -6563,23 +6707,15 @@ done:
 					      get_last_committed() + 1));
     return true;
 
-  } else if (prefix == "osd reweight-by-utilization") {
-    int64_t oload;
-    cmd_getval(g_ceph_context, cmdmap, "oload", oload, int64_t(120));
-    string out_str;
-    err = reweight_by_utilization(oload, out_str, false, NULL);
-    if (err < 0) {
-      ss << "FAILED reweight-by-utilization: " << out_str;
-    } else if (err == 0) {
-      ss << "no change: " << out_str;
-    } else {
-      ss << "SUCCESSFUL reweight-by-utilization: " << out_str;
-      getline(ss, rs);
-      wait_for_finished_proposal(new Monitor::C_Command(mon, m, 0, rs,
-						get_last_committed() + 1));
-      return true;
-    }
-  } else if (prefix == "osd reweight-by-pg") {
+  } else if (prefix == "osd reweight-by-pg" ||
+	     prefix == "osd reweight-by-utilization" ||
+	     prefix == "osd test-reweight-by-pg" ||
+	     prefix == "osd test-reweight-by-utilization") {
+    bool by_pg =
+      prefix == "osd reweight-by-pg" || prefix == "osd test-reweight-by-pg";
+    bool dry_run =
+      prefix == "osd test-reweight-by-pg" ||
+      prefix == "osd test-reweight-by-utilization";
     int64_t oload;
     cmd_getval(g_ceph_context, cmdmap, "oload", oload, int64_t(120));
     set<int64_t> pools;
@@ -6594,18 +6730,38 @@ done:
       }
       pools.insert(pool);
     }
+    double max_change = g_conf->mon_reweight_max_change;
+    cmd_getval(g_ceph_context, cmdmap, "max_change", max_change);
+    if (max_change <= 0.0) {
+      ss << "max_change " << max_change << " must be positive";
+      err = -EINVAL;
+      goto reply;
+    }
+    int64_t max_osds = g_conf->mon_reweight_max_osds;
+    cmd_getval(g_ceph_context, cmdmap, "max_osds", max_osds);
+    string no_increasing;
+    cmd_getval(g_ceph_context, cmdmap, "no_increasing", no_increasing);
     string out_str;
-    err = reweight_by_utilization(oload, out_str, true,
-				  pools.empty() ? NULL : &pools);
+    err = reweight_by_utilization(oload,
+				  max_change,
+				  max_osds,
+				  by_pg,
+				  pools.empty() ? NULL : &pools,
+				  no_increasing == "--no-increasing",
+				  dry_run,
+				  &ss, &out_str, f.get());
+    if (f)
+      f->flush(rdata);
+    else
+      rdata.append(out_str);
     if (err < 0) {
-      ss << "FAILED reweight-by-pg: " << out_str;
+      ss << "FAILED reweight-by-pg";
     } else if (err == 0) {
-      ss << "no change: " << out_str;
+      ss << "no change";
     } else {
-      ss << "SUCCESSFUL reweight-by-pg: " << out_str;
-      getline(ss, rs);
-      wait_for_finished_proposal(new Monitor::C_Command(mon, m, 0, rs,
-						get_last_committed() + 1));
+      ss << "SUCCESSFUL reweight-by-pg";
+      wait_for_finished_proposal(
+	new Monitor::C_Command(mon, m, 0, rs, rdata, get_last_committed() + 1));
       return true;
     }
   } else if (prefix == "osd thrash") {

@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [0.94.6], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [0.94.9], [ceph-devel@vger.kernel.org])
 
 # Create release string.  Used with VERSION for RPMs.
 RPM_RELEASE=0
@@ -51,6 +51,7 @@ darwin*)
 	;;
 linux*)
 	linux="yes"
+	CFLAGS="-D_LARGEFILE64_SOURCE ${CFLAGS}"
 	;;
 freebsd*)
 	freebsd="yes"
@@ -931,6 +932,9 @@ AC_CHECK_FUNC([sync_file_range],
 AC_CHECK_FUNC([fallocate],
 	[AC_DEFINE([CEPH_HAVE_FALLOCATE], [], [fallocate(2) is supported])],
 	[])
+
+# getgrouplist
+AC_CHECK_FUNCS([getgrouplist])
 
 #
 # Test for time-related `struct stat` members.

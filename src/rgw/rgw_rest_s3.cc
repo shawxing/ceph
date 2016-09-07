@@ -167,10 +167,14 @@ done:
     s->cio->print("%s: %s\r\n", riter->first.c_str(), riter->second.c_str());
   }
 
-  if (!content_type)
-    content_type = "binary/octet-stream";
+  if (ret == -ERR_NOT_MODIFIED) {
+      end_header(s, this);
+  } else {
+      if (!content_type)
+          content_type = "binary/octet-stream";
 
-  end_header(s, this, content_type);
+      end_header(s, this, content_type);
+  }
 
   if (metadata_bl.length()) {
     s->cio->write(metadata_bl.c_str(), metadata_bl.length());
@@ -263,8 +267,10 @@ void RGWListBucket_ObjStore_S3::send_versioned_response()
   s->formatter->dump_string("IsTruncated", (max && is_truncated ? "true" : "false"));
 
   bool encode_key = false;
-  if (strcasecmp(encoding_type.c_str(), "url") == 0)
+  if (strcasecmp(encoding_type.c_str(), "url") == 0) {
+    s->formatter->dump_string("EncodingType", "url");
     encode_key = true;
+  }
 
   if (ret >= 0) {
     vector<RGWObjEnt>::iterator iter;
@@ -340,8 +346,10 @@ void RGWListBucket_ObjStore_S3::send_response()
   s->formatter->dump_string("IsTruncated", (max && is_truncated ? "true" : "false"));
 
   bool encode_key = false;
-  if (strcasecmp(encoding_type.c_str(), "url") == 0)
+  if (strcasecmp(encoding_type.c_str(), "url") == 0) {
+    s->formatter->dump_string("EncodingType", "url");
     encode_key = true;
+  }
 
   if (ret >= 0) {
     vector<RGWObjEnt>::iterator iter;
@@ -1463,6 +1471,7 @@ int RGWCopyObj_ObjStore_S3::get_params()
 
   if (s->system_request) {
     source_zone = s->info.args.get(RGW_SYS_PARAM_PREFIX "source-zone");
+    s->info.args.get_bool(RGW_SYS_PARAM_PREFIX "copy-if-newer", &copy_if_newer, false);
     if (!source_zone.empty()) {
       client_id = s->info.args.get(RGW_SYS_PARAM_PREFIX "client-id");
       op_id = s->info.args.get(RGW_SYS_PARAM_PREFIX "op-id");
@@ -1804,7 +1813,7 @@ void RGWListMultipart_ObjStore_S3::send_response()
       }
 
       s->formatter->dump_unsigned("PartNumber", info.num);
-      s->formatter->dump_string("ETag", info.etag);
+      s->formatter->dump_format("ETag", "\"%s\"", info.etag.c_str());
       s->formatter->dump_unsigned("Size", info.size);
       s->formatter->close_section();
     }
@@ -2012,7 +2021,7 @@ RGWOp *RGWHandler_ObjStore_Bucket_S3::op_delete()
 
 RGWOp *RGWHandler_ObjStore_Bucket_S3::op_post()
 {
-  if ( s->info.request_params == "delete" ) {
+  if (s->info.args.exists("delete")) {
     return new RGWDeleteMultiObj_ObjStore_S3;
   }
 

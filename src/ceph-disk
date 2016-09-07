@@ -59,7 +59,7 @@ We rely on /dev/disk/by-partuuid to find partitions by their UUID;
 this is what the journal symlink inside the osd data volume normally
 points to.
 
-activate-all relies on /dev/disk/by-parttype-uuid/$typeuuid.$uuid to
+activate-all relies on /dev/disk/by-parttypeuuid/$typeuuid.$uuid to
 find all partitions.  We install special udev rules to create these
 links.
 
@@ -2440,6 +2440,28 @@ def get_partition_type(part):
 
 
 def get_partition_uuid(dev):
+    #
+    # blkid is prefered
+    #
+    what = 'ID_PART_ENTRY_UUID'
+    out, _ = command(
+        [
+            'blkid',
+            '-o',
+            'udev',
+            '-p',
+            dev,
+        ]
+    )
+    p = {}
+    for line in out.splitlines():
+        (key, value) = line.split('=')
+        p[key] = value
+    if what in p:
+        return p[what]
+    #
+    # if blkid does not deliver, fallback to sgdisk
+    #
     (base, partnum) = split_dev_base_partnum(dev)
     out, _ = command(['sgdisk', '-i', partnum, base])
     for line in out.splitlines():

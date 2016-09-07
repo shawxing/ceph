@@ -526,6 +526,9 @@ void PGLog::rewind_divergent_log(ObjectStore::Transaction& t, eversion_t newhead
   if (info.last_complete > newhead)
     info.last_complete = newhead;
 
+  if (log.rollback_info_trimmed_to > newhead)
+    log.rollback_info_trimmed_to = newhead;
+
   log.index();
 
   map<eversion_t, hobject_t> new_priors;
@@ -742,10 +745,12 @@ void PGLog::write_log(
   ObjectStore::Transaction& t, const coll_t& coll, const ghobject_t &log_oid)
 {
   if (is_dirty()) {
-    dout(10) << "write_log with: "
+    dout(5) << "write_log with: "
 	     << "dirty_to: " << dirty_to
 	     << ", dirty_from: " << dirty_from
-	     << ", dirty_divergent_priors: " << dirty_divergent_priors
+	     << ", dirty_divergent_priors: "
+	     << (dirty_divergent_priors ? "true" : "false")
+	     << ", divergent_priors: " << divergent_priors.size()
 	     << ", writeout_from: " << writeout_from
 	     << ", trimmed: " << trimmed
 	     << dendl;

@@ -413,6 +413,48 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     rados_completion->release();
   }
 
+  int rollback_parent(ImageCtx *ictx, uint64_t snap_id)
+  {
+    assert(ictx);
+    assert(ictx->parent_lock.is_locked());
+    assert(ictx->snap_lock.is_locked());
+
+    CephContext *cct = ictx->cct;
+    int r = 0;
+    std::map<librados::snap_t, SnapInfo>::const_iterator it = ictx->snap_info.find(snap_id);
+    if (it == ictx->snap_info.end()) {
+      ldout(cct, 10) << __func__ << ": no such snapshot: " << snap_id << dendl;
+      return -ENOENT;
+    }
+    const SnapInfo& snap_info(it->second);
+    if (ictx->parent_md == snap_info.parent) {
+      ldout(cct, 20) << __func__ << ": nop: head and snapshot have the same parent" << dendl;
+      return 0;
+    }
+    if (ictx->parent_md.spec.pool_id != -1) {
+       // remove the old parent link first, otherwise cls_client::set_parent
+       // will fail with -EEXISTS
+       ldout(cct, 20) << __func__ << ": removing the old parent link" << dendl;
+       r = cls_client::remove_parent(&ictx->md_ctx, ictx->header_oid);
+       if (r < 0) {
+         ldout(cct, 10) << __func__ << ": failed to remove parent link: "
+                        << cpp_strerror(r) << dendl;
+         return r;
+       }
+    }
+    if (snap_info.parent.spec.pool_id != -1) {
+      ldout(cct, 20) << __func__ << ": updating the parent link" << dendl;
+      r = cls_client::set_parent(&ictx->md_ctx, ictx->header_oid,
+                                 snap_info.parent.spec, snap_info.parent.overlap);
+      if (r < 0) {
+        ldout(cct, 10) << __func__ << ": failed to set parent link: "
+                       << cpp_strerror(r) << dendl;
+        return r;
+      }
+    }
+    return 0;
+  }
+
   int rollback_image(ImageCtx *ictx, uint64_t snap_id,
 		     ProgressContext& prog_ctx)
   {
@@ -443,6 +485,17 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     {
       RWLock::WLocker l(ictx->snap_lock);
       ictx->object_map.rollback(snap_id);
+    }
+
+    {
+      RWLock::WLocker snap_locker(ictx->snap_lock);
+      RWLock::WLocker parent_locker(ictx->parent_lock);
+      r = rollback_parent(ictx, snap_id);
+      if (r < 0) {
+          ldout(cct, 10) << __func__ << ": failed to rollback the parent link: "
+                         << cpp_strerror(r) << dendl;
+          return r;
+      }
     }
     return 0;
   }
@@ -612,7 +665,7 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     }
 
     RWLock::WLocker md_locker(ictx->md_lock);
-    r = _flush(ictx);
+    r = ictx->flush();
     if (r < 0) {
       return r;
     }
@@ -2164,7 +2217,7 @@ reprotect_and_return_err:
     } // release snap_lock and cache_lock
 
     if (new_snap) {
-      _flush(ictx);
+      ictx->flush();
     }
 
     ictx->refresh_lock.Lock();
@@ -2224,7 +2277,6 @@ reprotect_and_return_err:
       // writes might create new snapshots. Rolling back will replace
       // the current version, so we have to invalidate that too.
       RWLock::WLocker md_locker(ictx->md_lock);
-      ictx->flush_async_operations();
       r = ictx->invalidate_cache();
       if (r < 0) {
 	return r;
@@ -2446,7 +2498,7 @@ reprotect_and_return_err:
       // get -EROFS for writes
       RWLock::RLocker owner_locker(ictx->owner_lock);
       RWLock::WLocker md_locker(ictx->md_lock);
-      ictx->flush_cache();
+      ictx->flush();
     }
     int r = _snap_set(ictx, snap_name);
     if (r < 0) {
@@ -2893,7 +2945,7 @@ reprotect_and_return_err:
     // ensure previous writes are visible to listsnaps
     {
       RWLock::RLocker owner_locker(ictx->owner_lock);
-      _flush(ictx);
+      ictx->flush();
     }
 
     int r = ictx_check(ictx);
@@ -3275,19 +3327,9 @@ reprotect_and_return_err:
 
     C_AioWrite *flush_ctx = new C_AioWrite(cct, c);
     c->add_request();
-    ictx->flush_async_operations(flush_ctx);
+    ictx->flush(flush_ctx);
 
     c->init_time(ictx, AIO_TYPE_FLUSH);
-    C_AioWrite *req_comp = new C_AioWrite(cct, c);
-    c->add_request();
-    if (ictx->object_cacher) {
-      ictx->flush_cache_aio(req_comp);
-    } else {
-      librados::AioCompletion *rados_completion =
-	librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
-      ictx->data_ctx.aio_flush_async(rados_completion);
-      rados_completion->release();
-    }
     c->finish_adding_requests(cct);
     c->put();
     ictx->perfcounter->inc(l_librbd_aio_flush);
@@ -3306,28 +3348,9 @@ reprotect_and_return_err:
     ictx->user_flushed();
     {
       RWLock::RLocker owner_locker(ictx->owner_lock);
-      r = _flush(ictx);
+      r = ictx->flush();
     }
     ictx->perfcounter->inc(l_librbd_flush);
-    return r;
-  }
-
-  int _flush(ImageCtx *ictx)
-  {
-    assert(ictx->owner_lock.is_locked());
-    CephContext *cct = ictx->cct;
-    int r;
-    // flush any outstanding writes
-    if (ictx->object_cacher) {
-      r = ictx->flush_cache();
-    } else {
-      r = ictx->data_ctx.aio_flush();
-      ictx->flush_async_operations();
-    }
-
-    if (r)
-      lderr(cct) << "_flush " << ictx << " r = " << r << dendl;
-
     return r;
   }
 
@@ -3340,8 +3363,6 @@ reprotect_and_return_err:
     if (r < 0) {
       return r;
     }
-
-    ictx->flush_async_operations();
 
     RWLock::RLocker owner_locker(ictx->owner_lock);
     RWLock::WLocker md_locker(ictx->md_lock);

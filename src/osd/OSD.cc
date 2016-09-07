@@ -210,6 +210,7 @@ OSDService::OSDService(OSD *osd) :
   pg_epoch_lock("OSDService::pg_epoch_lock"),
   publish_lock("OSDService::publish_lock"),
   pre_publish_lock("OSDService::pre_publish_lock"),
+  max_oldest_map(0),
   peer_map_epoch_lock("OSDService::peer_map_epoch_lock"),
   sched_scrub_lock("OSDService::sched_scrub_lock"), scrubs_pending(0),
   scrubs_active(0),
@@ -1031,7 +1032,7 @@ MOSDMap *OSDService::build_incremental_map_msg(epoch_t since, epoch_t to,
                                                OSDSuperblock& sblock)
 {
   MOSDMap *m = new MOSDMap(monc->get_fsid());
-  m->oldest_map = sblock.oldest_map;
+  m->oldest_map = max_oldest_map.read();
   m->newest_map = sblock.newest_map;
   
   for (epoch_t e = to; e > since; e--) {
@@ -1071,7 +1072,7 @@ void OSDService::send_incremental_map(epoch_t since, Connection *con,
     if (since < sblock.oldest_map) {
       // just send latest full map
       MOSDMap *m = new MOSDMap(monc->get_fsid());
-      m->oldest_map = sblock.oldest_map;
+      m->oldest_map = max_oldest_map.read();
       m->newest_map = sblock.newest_map;
       get_map_bl(to, m->maps[to]);
       send_map(m, con);
@@ -1809,6 +1810,9 @@ int OSD::init()
 
   dout(2) << "boot" << dendl;
 
+  int rotating_auth_attempts = 0;
+  const int max_rotating_auth_attempts = 10;
+
   // read superblock
   r = read_superblock();
   if (r < 0) {
@@ -1936,6 +1940,7 @@ int OSD::init()
   service.init();
   service.publish_map(osdmap);
   service.publish_superblock(superblock);
+  service.max_oldest_map.set(superblock.oldest_map);
 
   osd_lock.Unlock();
 
@@ -1949,6 +1954,14 @@ int OSD::init()
 
   while (monc->wait_auth_rotating(30.0) < 0) {
     derr << "unable to obtain rotating service keys; retrying" << dendl;
+    ++rotating_auth_attempts;
+    if (rotating_auth_attempts > max_rotating_auth_attempts) {
+        osd_lock.Lock(); // make locker happy
+        if (!is_stopping()) {
+            r = - ETIMEDOUT;
+        }
+        goto monout;
+    }
   }
 
   osd_lock.Lock();
@@ -2089,6 +2102,13 @@ void OSD::final_init()
     "name=objname,type=CephObjectname",
     test_ops_hook,
     "inject metadata error");
+  assert(r == 0);
+  r = admin_socket->register_command(
+    "set_recovery_delay",
+    "set_recovery_delay " \
+    "name=utime,type=CephInt,req=false",
+    test_ops_hook,
+     "Delay osd recovery by specified seconds");
   assert(r == 0);
 }
 
@@ -2323,6 +2343,7 @@ int OSD::shutdown()
   cct->get_admin_socket()->unregister_command("truncobj");
   cct->get_admin_socket()->unregister_command("injectdataerr");
   cct->get_admin_socket()->unregister_command("injectmdataerr");
+  cct->get_admin_socket()->unregister_command("set_recovery_delay");
   delete test_ops_hook;
   test_ops_hook = NULL;
 
@@ -2840,7 +2861,7 @@ void OSD::load_pgs()
 	  derr << __func__ << ": could not find map for epoch " << map_epoch
 	       << " on pg " << pgid << ", but the pool is not present in the "
 	       << "current map, so this is probably a result of bug 10617.  "
-	       << "Skipping the pg for now, you can use ceph_objectstore_tool "
+	       << "Skipping the pg for now, you can use ceph-objectstore-tool "
 	       << "to clean it up later." << dendl;
 	  continue;
 	} else {
@@ -2965,8 +2986,11 @@ void OSD::build_past_intervals_parallel()
       PG *pg = i->second;
 
       epoch_t start, end;
-      if (!pg->_calc_past_interval_range(&start, &end, superblock.oldest_map))
+      if (!pg->_calc_past_interval_range(&start, &end, superblock.oldest_map)) {
+        if (pg->info.history.same_interval_since == 0)
+          pg->info.history.same_interval_since = end;
         continue;
+      }
 
       dout(10) << pg->info.pgid << " needs " << start << "-" << end << dendl;
       pistate& p = pis[pg];
@@ -3049,6 +3073,21 @@ void OSD::build_past_intervals_parallel()
 	p.up_primary = up_primary;
 	p.same_interval_since = cur_epoch;
       }
+    }
+  }
+
+  // Now that past_intervals have been recomputed let's fix the same_interval_since
+  // if it was cleared by import.
+  for (map<PG*,pistate>::iterator i = pis.begin(); i != pis.end(); ++i) {
+    PG *pg = i->first;
+    pistate& p = i->second;
+
+    if (pg->info.history.same_interval_since == 0) {
+      assert(p.same_interval_since);
+      dout(10) << __func__ << " fix same_interval_since " << p.same_interval_since << " pg " << *pg << dendl;
+      dout(10) << __func__ << " past_intervals " << pg->past_intervals << dendl;
+      // Fix it
+      pg->info.history.same_interval_since = p.same_interval_since;
     }
   }
 
@@ -4011,6 +4050,8 @@ void OSD::check_ops_in_flight()
 //   truncobj <pool-id> [namespace/]<obj-name> <newlen>
 //   injectmdataerr [namespace/]<obj-name>
 //   injectdataerr [namespace/]<obj-name>
+//
+//   set_recovery_delay [utime]
 void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
      std::string command, cmdmap_t& cmdmap, ostream &ss)
 {
@@ -4131,6 +4172,24 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
       store->inject_mdata_error(obj);
       ss << "ok";
     }
+    return;
+  }
+  if (command == "set_recovery_delay") {
+    int64_t delay;
+    cmd_getval(service->cct, cmdmap, "utime", delay, (int64_t)0);
+    ostringstream oss;
+    oss << delay;
+    int r = service->cct->_conf->set_val("osd_recovery_delay_start",
+					 oss.str().c_str());
+    if (r != 0) {
+      ss << "set_recovery_delay: error setting "
+	 << "osd_recovery_delay_start to '" << delay << "': error "
+	 << r;
+      return;
+    }
+    service->cct->_conf->apply_changes(NULL);
+    ss << "set_recovery_delay: set osd_recovery_delay_start "
+       << "to " << service->cct->_conf->osd_recovery_delay_start;
     return;
   }
   ss << "Internal error - command=" << command;
@@ -5382,6 +5441,7 @@ void OSD::dispatch_session_waiting(Session *session, OSDMapRef osdmap)
   } else {
     register_session_waiting_on_map(session);
   }
+  session->maybe_reset_osdmap();
 }
 
 
@@ -5460,6 +5520,7 @@ void OSD::session_notify_pg_cleared(
   assert(session->session_dispatch_lock.is_locked());
   update_waiting_for_pg(session, osdmap);
   session->waiting_for_pg.erase(pgid);
+  session->maybe_reset_osdmap();
   clear_session_waiting_on_pg(session, pgid);
 }
 
@@ -6106,6 +6167,48 @@ void OSD::osdmap_subscribe(version_t epoch, bool force_request)
   }
 }
 
+void OSD::trim_maps(epoch_t oldest, int nreceived, bool skip_maps)
+{
+  epoch_t min = std::min(oldest, service.map_cache.cached_key_lower_bound());
+  if (superblock.oldest_map >= min)
+    return;
+
+  int num = 0;
+  ObjectStore::Transaction *t = NULL;
+  for (epoch_t e = superblock.oldest_map; e < min; ++e) {
+    dout(20) << " removing old osdmap epoch " << e << dendl;
+    if (!t) {
+      t = new ObjectStore::Transaction;
+    }
+    t->remove(META_COLL, get_osdmap_pobject_name(e));
+    t->remove(META_COLL, get_inc_osdmap_pobject_name(e));
+    superblock.oldest_map = e + 1;
+    num++;
+    if (num >= cct->_conf->osd_target_transaction_size && num >= nreceived) {
+      service.publish_superblock(superblock);
+      write_superblock(*t);
+      store->queue_transaction_and_cleanup(NULL, t);
+      t = NULL;
+      num = 0;
+      if (!skip_maps) {
+	// skip_maps leaves us with a range of old maps if we fail to remove all
+	// of them before moving superblock.oldest_map forward to the first map
+	// in the incoming MOSDMap msg. so we should continue removing them in
+	// this case, even we could do huge series of delete transactions all at
+	// once.
+	break;
+      }
+    }
+  }
+  if (num > 0) {
+    service.publish_superblock(superblock);
+    write_superblock(*t);
+    store->queue_transaction_and_cleanup(NULL, t);
+  }
+  // we should not remove the cached maps
+  assert(min <= service.map_cache.cached_key_lower_bound());
+}
+
 void OSD::handle_osd_map(MOSDMap *m)
 {
   assert(osd_lock.is_locked());
@@ -6147,6 +6250,10 @@ void OSD::handle_osd_map(MOSDMap *m)
   logger->inc(l_osd_mape, last - first + 1);
   if (first <= osdmap->get_epoch())
     logger->inc(l_osd_mape_dup, osdmap->get_epoch() - first + 1);
+  if (service.max_oldest_map.read() < m->oldest_map) {
+    service.max_oldest_map.set(m->oldest_map);
+    assert(service.max_oldest_map.read() >= superblock.oldest_map);
+  }
 
   // make sure there is something new, here, before we bother flushing the queues and such
   if (last <= osdmap->get_epoch()) {
@@ -6243,6 +6350,9 @@ void OSD::handle_osd_map(MOSDMap *m)
 		<< " but failed to encode full with correct crc; requesting"
 		<< dendl;
 	clog->warn() << "failed to encode map e" << e << " with expected crc\n";
+	dout(20) << "my encoded map was:\n";
+	fbl.hexdump(*_dout);
+	*_dout << dendl;
 	delete o;
 	MMonGetOSDMap *req = new MMonGetOSDMap;
 	req->request_full(e, last);
@@ -6273,20 +6383,8 @@ void OSD::handle_osd_map(MOSDMap *m)
   }
 
   if (superblock.oldest_map) {
-    int num = 0;
-    epoch_t min(
-      MIN(m->oldest_map,
-	  service.map_cache.cached_key_lower_bound()));
-    for (epoch_t e = superblock.oldest_map; e < min; ++e) {
-      dout(20) << " removing old osdmap epoch " << e << dendl;
-      t.remove(META_COLL, get_osdmap_pobject_name(e));
-      t.remove(META_COLL, get_inc_osdmap_pobject_name(e));
-      superblock.oldest_map = e+1;
-      num++;
-      if (num >= cct->_conf->osd_target_transaction_size &&
-	  (uint64_t)num > (last - first))  // make sure we at least keep pace with incoming maps
-	break;
-    }
+    // make sure we at least keep pace with incoming maps
+    trim_maps(m->oldest_map, last - first + 1, skip_maps);
   }
 
   if (!superblock.oldest_map || skip_maps)
@@ -6706,11 +6804,7 @@ void OSD::consume_map()
   for (set<spg_t>::iterator p = pgs_to_check.begin();
        p != pgs_to_check.end();
        ++p) {
-    vector<int> acting;
-    int nrep = osdmap->pg_to_acting_osds(p->pgid, acting);
-    int role = osdmap->calc_pg_role(whoami, acting, nrep);
-
-    if (role < 0) {
+    if (!(osdmap->is_acting_osd_shard(p->pgid, whoami, p->shard))) {
       set<Session*> concerned_sessions;
       get_sessions_possibly_interested_in_pg(*p, &concerned_sessions);
       for (set<Session*>::iterator i = concerned_sessions.begin();

@@ -61,7 +61,7 @@ ostream& ObjBencher::out(ostream& os, utime_t& t)
   if (show_time)
     return t.localtime(os) << " ";
   else
-    return os << " ";
+    return os;
 }
 
 ostream& ObjBencher::out(ostream& os)
@@ -86,19 +86,19 @@ void *ObjBencher::status_printer(void *_bencher) {
 
     if (i % 20 == 0) {
       if (i > 0)
-	cur_time.localtime(cout) << "min lat: " << data.min_latency
+	cur_time.localtime(cout) << " min lat: " << data.min_latency
 	     << " max lat: " << data.max_latency
 	     << " avg lat: " << data.avg_latency << std::endl;
       //I'm naughty and don't reset the fill
       bencher->out(cout, cur_time) << setfill(' ')
-	   << setw(5) << "sec"
-	   << setw(8) << "Cur ops"
-	   << setw(10) << "started"
-	   << setw(10) << "finished"
-	   << setw(10) << "avg MB/s"
-	   << setw(10) << "cur MB/s"
-	   << setw(10) << "last lat"
-	   << setw(10) << "avg lat" << std::endl;
+        << setw(5) << "sec"
+        << setw(8) << "Cur ops"
+        << setw(10) << "started"
+        << setw(10) << "finished"
+        << setw(10) << "avg MB/s"
+        << setw(10) << "cur MB/s"
+        << setw(12) << "last lat(s)"
+        << setw(12) << "avg lat(s)" << std::endl;
     }
     if (cycleSinceChange)
       bandwidth = (double)(data.finished - previous_writes)
@@ -122,26 +122,28 @@ void *ObjBencher::status_printer(void *_bencher) {
     if (previous_writes != data.finished) {
       previous_writes = data.finished;
       cycleSinceChange = 0;
-      bencher->out(cout, cur_time) << setfill(' ')
-	   << setw(5) << i
-	   << setw(8) << data.in_flight
-	   << setw(10) << data.started
-	   << setw(10) << data.finished
-	   << setw(10) << avg_bandwidth
-	   << setw(10) << bandwidth
-	   << setw(10) << (double)data.cur_latency
-	   << setw(10) << data.avg_latency << std::endl;
+      bencher->out(cout, cur_time)
+        << setfill(' ')
+        << setw(5) << i
+        << ' ' << setw(7) << data.in_flight
+        << ' ' << setw(9) << data.started
+        << ' ' << setw(9) << data.finished
+        << ' ' << setw(9) << avg_bandwidth
+        << ' ' << setw(9) << bandwidth
+        << ' ' << setw(11) << (double)data.cur_latency
+        << ' ' << setw(11) << data.avg_latency << std::endl;
     }
     else {
-      bencher->out(cout, cur_time) << setfill(' ')
-	   << setw(5) << i
-	   << setw(8) << data.in_flight
-	   << setw(10) << data.started
-	   << setw(10) << data.finished
-	   << setw(10) << avg_bandwidth
-	   << setw(10) << '0'
-	   << setw(10) << '-'
-	   << setw(10) << data.avg_latency << std::endl;
+      bencher->out(cout, cur_time)
+        << setfill(' ')
+        << setw(5) << i
+        << ' ' << setw(7) << data.in_flight
+        << ' ' << setw(9) << data.started
+        << ' ' << setw(9) << data.finished
+        << ' ' << setw(9) << avg_bandwidth
+        << ' ' << setw(9) << '0'
+        << ' ' << setw(11) << '-'
+        << ' '<< setw(11) << data.avg_latency << std::endl;
     }
     ++i;
     ++cycleSinceChange;
@@ -453,20 +455,19 @@ int ObjBencher::write_bench(int secondsToRun, int maxObjectsToCreate,
   double bandwidth;
   bandwidth = ((double)data.finished)*((double)data.object_size)/(double)timePassed;
   bandwidth = bandwidth/(1024*1024); // we want it in MB/sec
-  char bw[20];
-  snprintf(bw, sizeof(bw), "%.3lf \n", bandwidth);
 
   out(cout) << "Total time run:         " << timePassed << std::endl
        << "Total writes made:      " << data.finished << std::endl
        << "Write size:             " << data.object_size << std::endl
-       << "Bandwidth (MB/sec):     " << bw << std::endl
+       << "Bandwidth (MB/sec):     " << setprecision(6) << bandwidth << std::endl
        << "Stddev Bandwidth:       " << vec_stddev(data.history.bandwidth) << std::endl
        << "Max bandwidth (MB/sec): " << data.idata.max_bandwidth << std::endl
        << "Min bandwidth (MB/sec): " << data.idata.min_bandwidth << std::endl
-       << "Average Latency:        " << data.avg_latency << std::endl
-       << "Stddev Latency:         " << vec_stddev(data.history.latency) << std::endl
-       << "Max latency:            " << data.max_latency << std::endl
-       << "Min latency:            " << data.min_latency << std::endl;
+       << "Average IOPS:           " << (int)(data.finished/timePassed) << std::endl
+       << "Average Latency(s):     " << data.avg_latency << std::endl
+       << "Stddev Latency(s):      " << vec_stddev(data.history.latency) << std::endl
+       << "Max latency(s):         " << data.max_latency << std::endl
+       << "Min latency(s):         " << data.min_latency << std::endl;
 
   //write object size/number data for read benchmarks
   ::encode(data.object_size, b_write);
@@ -598,13 +599,13 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
     index[slot] = data.started;
     lock.Unlock();
     completion_wait(slot);
+    lock.Lock();
     r = completion_ret(slot);
     if (r < 0) {
       cerr << "read got " << r << std::endl;
       lock.Unlock();
       goto ERR;
     }
-    lock.Lock();
     total_latency += data.cur_latency;
     if (data.cur_latency > data.max_latency) data.max_latency = data.cur_latency;
     if (data.cur_latency < data.min_latency) data.min_latency = data.cur_latency;
@@ -624,14 +625,7 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
     lock.Lock();
     ++data.started;
     ++data.in_flight;
-      lock.Unlock();
-    if (memcmp(data.object_contents, cur_contents->c_str(), data.object_size) != 0) {
-      cerr << name[slot] << " is not correct!" << std::endl;
-      ++errors;
-    } else {
-      lock.Unlock();
-    }
-
+    lock.Unlock();
     name[slot] = newName;
   }
 
@@ -677,20 +671,19 @@ int ObjBencher::seq_read_bench(int seconds_to_run, int num_objects, int concurre
   double bandwidth;
   bandwidth = ((double)data.finished)*((double)data.object_size)/(double)runtime;
   bandwidth = bandwidth/(1024*1024); // we want it in MB/sec
-  char bw[20];
-  snprintf(bw, sizeof(bw), "%.3lf \n", bandwidth);
 
-  out(cout) << "Total time run:        " << runtime << std::endl
+  out(cout) << "Total time run:       " << runtime << std::endl
        << "Total reads made:     " << data.finished << std::endl
        << "Read size:            " << data.object_size << std::endl
-       << "Bandwidth (MB/sec):    " << bw << std::endl
-       << "Average Latency:       " << data.avg_latency << std::endl
-       << "Max latency:           " << data.max_latency << std::endl
-       << "Min latency:           " << data.min_latency << std::endl;
+       << "Bandwidth (MB/sec):   " << setprecision(6) << bandwidth << std::endl
+       << "Average IOPS:         " << (int)(data.finished/runtime) << std::endl
+       << "Average Latency(s):   " << data.avg_latency << std::endl
+       << "Max latency(s):       " << data.max_latency << std::endl
+       << "Min latency(s):       " << data.min_latency << std::endl;
 
   completions_done();
 
-  return 0;
+  return (errors > 0 ? -EIO : 0);
 
  ERR:
   lock.Lock();
@@ -885,20 +878,19 @@ int ObjBencher::rand_read_bench(int seconds_to_run, int num_objects, int concurr
   double bandwidth;
   bandwidth = ((double)data.finished)*((double)data.object_size)/(double)runtime;
   bandwidth = bandwidth/(1024*1024); // we want it in MB/sec
-  char bw[20];
-  snprintf(bw, sizeof(bw), "%.3lf \n", bandwidth);
 
-  out(cout) << "Total time run:        " << runtime << std::endl
+  out(cout) << "Total time run:       " << runtime << std::endl
        << "Total reads made:     " << data.finished << std::endl
        << "Read size:            " << data.object_size << std::endl
-       << "Bandwidth (MB/sec):    " << bw << std::endl
-       << "Average Latency:       " << data.avg_latency << std::endl
-       << "Max latency:           " << data.max_latency << std::endl
-       << "Min latency:           " << data.min_latency << std::endl;
+       << "Bandwidth (MB/sec):   " << setprecision(6) << bandwidth << std::endl
+       << "Average IOPS:         " << (int)(data.finished/runtime) << std::endl
+       << "Average Latency(s):   " << data.avg_latency << std::endl
+       << "Max latency(s):       " << data.max_latency << std::endl
+       << "Min latency(s):       " << data.min_latency << std::endl;
 
   completions_done();
 
-  return 0;
+  return (errors > 0 ? -EIO : 0);
 
  ERR:
   lock.Lock();

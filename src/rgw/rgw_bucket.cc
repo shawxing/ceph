@@ -17,6 +17,7 @@
 #include "rgw_user.h"
 #include "rgw_string.h"
 
+#include "include/rados/librados.hpp"
 // until everything is moved from rgw_common
 #include "rgw_common.h"
 
@@ -138,9 +139,6 @@ int rgw_link_bucket(RGWRados *store, string user_id, rgw_bucket& bucket, time_t 
     ret = store->get_bucket_entrypoint_info(obj_ctx, bucket_name, ep, &ot, NULL, &attrs);
     if (ret < 0 && ret != -ENOENT) {
       ldout(store->ctx(), 0) << "ERROR: store->get_bucket_entrypoint_info() returned " << ret << dendl;
-    } else if (ret >= 0 && ep.linked && ep.owner != user_id) {
-      ldout(store->ctx(), 0) << "can't link bucket, already linked to a different user: " << ep.owner << dendl;
-      return -EINVAL;
     }
   }
 
@@ -389,9 +387,7 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
   map<RGWObjCategory, RGWStorageStats> stats;
   std::vector<RGWObjEnt> objs;
   map<string, bool> common_prefixes;
-  rgw_obj obj;
   RGWBucketInfo info;
-  bufferlist bl;
   RGWObjectCtx obj_ctx(store);
 
   string bucket_ver, master_ver;
@@ -399,8 +395,6 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
   ret = store->get_bucket_stats(bucket, &bucket_ver, &master_ver, stats, NULL);
   if (ret < 0)
     return ret;
-
-  obj.bucket = bucket;
 
   ret = store->get_bucket_info(obj_ctx, bucket.name, info, NULL);
   if (ret < 0)
@@ -420,7 +414,7 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
 
     while (!objs.empty()) {
       std::vector<RGWObjEnt>::iterator it = objs.begin();
-      for (it = objs.begin(); it != objs.end(); ++it) {
+      for (; it != objs.end(); ++it) {
         ret = rgw_remove_object(store, info, bucket, (*it).key);
         if (ret < 0)
           return ret;
@@ -433,6 +427,11 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
     }
   }
 
+  ret = rgw_bucket_sync_user_stats(store, bucket.name);
+  if ( ret < 0) {
+     dout(1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
+  }
+
   RGWObjVersionTracker objv_tracker;
 
   ret = store->delete_bucket(bucket, objv_tracker);
@@ -442,6 +441,173 @@ int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& b
   }
 
   ret = rgw_unlink_bucket(store, info.owner, bucket.name);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: unable to remove user bucket information" << dendl;
+  }
+
+  return ret;
+}
+
+static int aio_wait(librados::AioCompletion *handle)
+{
+  librados::AioCompletion *c = (librados::AioCompletion *)handle;
+  c->wait_for_complete();
+  int ret = c->get_return_value();
+  c->release();
+  return ret;
+}
+
+static int drain_handles(list<librados::AioCompletion *>& pending)
+{
+  int ret = 0;
+  while (!pending.empty()) {
+    librados::AioCompletion *handle = pending.front();
+    pending.pop_front();
+    int r = aio_wait(handle);
+    if (r < 0) {
+      ret = r;
+    }
+  }
+  return ret;
+}
+
+int rgw_remove_bucket_bypass_gc(RGWRados *store, rgw_bucket& bucket,
+                                int concurrent_max, bool keep_index_consistent)
+{
+  int ret;
+  map<RGWObjCategory, RGWStorageStats> stats;
+  std::vector<RGWObjEnt> objs;
+  map<string, bool> common_prefixes;
+  RGWBucketInfo info;
+  RGWObjectCtx obj_ctx(store);
+
+  string bucket_ver, master_ver;
+
+  ret = store->get_bucket_stats(bucket, &bucket_ver, &master_ver, stats, NULL);
+  if (ret < 0)
+    return ret;
+
+  ret = store->get_bucket_info(obj_ctx, bucket.name, info, NULL);
+  if (ret < 0)
+    return ret;
+
+
+  RGWRados::Bucket target(store, info.bucket);
+  RGWRados::Bucket::List list_op(&target);
+
+  list_op.params.list_versions = true;
+
+  std::list<librados::AioCompletion*> handles;
+
+  int max = 1000;
+  int max_aio = concurrent_max;
+  ret = list_op.list_objects(max, &objs, &common_prefixes, NULL);
+  if (ret < 0)
+    return ret;
+
+  while (!objs.empty()) {
+    std::vector<RGWObjEnt>::iterator it = objs.begin();
+    for (; it != objs.end(); ++it) {
+      RGWObjState *astate = NULL;
+      rgw_obj obj(bucket, (*it).key.name);
+      obj.set_instance((*it).key.instance);
+
+      ret = store->get_obj_state(&obj_ctx, obj, &astate, NULL);
+      if (ret == -ENOENT) {
+        dout(1) << "WARNING: cannot find obj state for obj " << obj.get_object() << dendl;
+        continue;
+      }
+      if (ret < 0) {
+        lderr(store->ctx()) << "ERROR: get obj state returned with error " << ret << dendl;
+        return ret;
+      }
+
+      if (astate->has_manifest) {
+        rgw_obj head_obj;
+        RGWObjManifest& manifest = astate->manifest;
+        RGWObjManifest::obj_iterator miter = manifest.obj_begin();
+
+        if (miter.get_location().ns.empty()) {
+          head_obj = miter.get_location();
+        }
+
+        for (; miter != manifest.obj_end() && max_aio--; ++miter) {
+          if (!max_aio) {
+            ret = drain_handles(handles);
+            if (ret < 0) {
+              lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+              return ret;
+            }
+            max_aio = concurrent_max;
+          }
+
+          rgw_obj last_obj = miter.get_location();
+          if (last_obj == head_obj) {
+            // have the head obj deleted at the end
+            continue;
+          }
+
+          ret = store->delete_obj_aio(last_obj, bucket, info, astate, handles, keep_index_consistent);
+          if (ret < 0) {
+            lderr(store->ctx()) << "ERROR: delete obj aio failed with " << ret << dendl;
+            return ret;
+          }
+        } // for all shadow objs
+
+        ret = store->delete_obj_aio(head_obj, bucket, info, astate, handles, keep_index_consistent);
+        if (ret < 0) {
+          lderr(store->ctx()) << "ERROR: delete obj aio failed with " << ret << dendl;
+          return ret;
+        }
+      }
+
+      if (!max_aio) {
+        ret = drain_handles(handles);
+        if (ret < 0) {
+          lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+          return ret;
+        }
+        max_aio = concurrent_max;
+      }
+    } // for all RGW objects
+    objs.clear();
+
+    ret = list_op.list_objects(max, &objs, &common_prefixes, NULL);
+    if (ret < 0)
+      return ret;
+  }
+
+  ret = drain_handles(handles);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+    return ret;
+  }
+
+  ret = rgw_bucket_sync_user_stats(store, bucket.name);
+  if (ret < 0) {
+     dout(1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
+  }
+
+  RGWObjVersionTracker objv_tracker;
+
+  ret = rgw_bucket_delete_bucket_obj(store, bucket.name, objv_tracker);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: could not remove bucket " << bucket.name << "with ret as " << ret << dendl;
+    return ret;
+  }
+
+  if (!store->is_syncing_bucket_meta(bucket)) {
+    RGWObjVersionTracker objv_tracker;
+    string entry;
+    store->get_bucket_instance_entry(bucket, entry);
+    ret = rgw_bucket_instance_remove_entry(store, entry, &objv_tracker);
+    if (ret < 0) {
+      lderr(store->ctx()) << "ERROR: could not remove bucket instance entry" << bucket.name << "with ret as " << ret << dendl;
+      return ret;
+    }
+  }
+
+  ret = rgw_unlink_bucket(store, info.owner, bucket.name, false);
   if (ret < 0) {
     lderr(store->ctx()) << "ERROR: unable to remove user bucket information" << dendl;
   }
@@ -542,7 +708,7 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
       return -EIO;
     }
 
-    r = rgw_unlink_bucket(store, owner.get_id(), bucket.name);
+    r = rgw_unlink_bucket(store, owner.get_id(), bucket.name, false);
     if (r < 0) {
       set_err_msg(err_msg, "could not unlink policy from user " + owner.get_id());
       return r;
@@ -569,6 +735,17 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
     if (r < 0)
       return r;
 
+    RGWAccessControlPolicy policy_instance;
+    policy_instance.create_default(user_info.user_id, display_name);
+    aclbl.clear();
+    policy_instance.encode(aclbl);
+
+    string oid_bucket_instance = RGW_BUCKET_INSTANCE_MD_PREFIX + key;
+    rgw_bucket bucket_instance;
+    bucket_instance.name = oid_bucket_instance;
+    rgw_obj obj_bucket_instance(bucket_instance, no_oid);
+    r = store->set_attr(NULL, obj_bucket_instance, RGW_ATTR_ACL, aclbl, &objv_tracker);
+
     r = rgw_link_bucket(store, user_info.user_id, bucket, 0);
     if (r < 0)
       return r;
@@ -594,12 +771,24 @@ int RGWBucket::unlink(RGWBucketAdminOpState& op_state, std::string *err_msg)
   return r;
 }
 
-int RGWBucket::remove(RGWBucketAdminOpState& op_state, std::string *err_msg)
+int RGWBucket::remove(RGWBucketAdminOpState& op_state, bool bypass_gc,
+                      bool keep_index_consistent, std::string *err_msg)
 {
   bool delete_children = op_state.will_delete_children();
   rgw_bucket bucket = op_state.get_bucket();
+  int ret;
 
-  int ret = rgw_remove_bucket(store, bucket_info.owner, bucket, delete_children);
+  if (bypass_gc) {
+    if (delete_children) {
+      ret = rgw_remove_bucket_bypass_gc(store, bucket, op_state.get_max_aio(), keep_index_consistent);
+    } else {
+      set_err_msg(err_msg, "purge objects should be set for gc to be bypassed");
+      return -EINVAL;
+    }
+  } else {
+    ret = rgw_remove_bucket(store, bucket_info.owner, bucket, delete_children);
+  }
+
   if (ret < 0) {
     set_err_msg(err_msg, "unable to remove bucket" + cpp_strerror(-ret));
     return ret;
@@ -967,7 +1156,8 @@ int RGWBucketAdminOp::check_index(RGWRados *store, RGWBucketAdminOpState& op_sta
   return 0;
 }
 
-int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_state)
+int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_state,
+                                    bool bypass_gc, bool keep_index_consistent)
 {
   RGWBucket bucket;
 
@@ -975,7 +1165,7 @@ int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_s
   if (ret < 0)
     return ret;
 
-  return bucket.remove(op_state);
+  return bucket.remove(op_state, bypass_gc, keep_index_consistent);
 }
 
 int RGWBucketAdminOp::remove_object(RGWRados *store, RGWBucketAdminOpState& op_state)
@@ -1552,7 +1742,11 @@ public:
   int put(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker,
           time_t mtime, JSONObj *obj, sync_type_t sync_type) {
     RGWBucketEntryPoint be, old_be;
-    decode_json_obj(be, obj);
+    try {
+      decode_json_obj(be, obj);
+    } catch (JSONDecoder::err& e) {
+      return -EINVAL;
+    }
 
     time_t orig_mtime;
     map<string, bufferlist> attrs;
@@ -1712,7 +1906,11 @@ public:
   int put(RGWRados *store, string& oid, RGWObjVersionTracker& objv_tracker,
           time_t mtime, JSONObj *obj, sync_type_t sync_type) {
     RGWBucketCompleteInfo bci, old_bci;
-    decode_json_obj(bci, obj);
+    try {
+      decode_json_obj(bci, obj);
+    } catch (JSONDecoder::err& e) {
+      return -EINVAL;
+    }
 
     time_t orig_mtime;
     RGWObjectCtx obj_ctx(store);

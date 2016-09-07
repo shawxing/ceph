@@ -2486,6 +2486,52 @@ TEST_F(TestLibRBD, TestPendingAio)
   rados_ioctx_destroy(ioctx);
 }
 
+TEST_F(TestLibRBD, Flatten)
+{
+  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+
+  librados::IoCtx ioctx;
+  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+
+  librbd::RBD rbd;
+  std::string parent_name = get_temp_image_name();
+  uint64_t size = 2 << 20;
+  int order = 0;
+  ASSERT_EQ(0, create_image_pp(rbd, ioctx, parent_name.c_str(), size, &order));
+
+  librbd::Image parent_image;
+  ASSERT_EQ(0, rbd.open(ioctx, parent_image, parent_name.c_str(), NULL));
+
+  bufferlist bl;
+  bl.append(std::string(4096, '1'));
+  ASSERT_EQ(bl.length(), parent_image.write(0, bl.length(), bl));
+
+  ASSERT_EQ(0, parent_image.snap_create("snap1"));
+  ASSERT_EQ(0, parent_image.snap_protect("snap1"));
+
+  uint64_t features;
+  ASSERT_EQ(0, parent_image.features(&features));
+
+  std::string clone_name = get_temp_image_name();
+  EXPECT_EQ(0, rbd.clone(ioctx, parent_name.c_str(), "snap1", ioctx,
+			 clone_name.c_str(), features, &order));
+
+  librbd::Image clone_image;
+  ASSERT_EQ(0, rbd.open(ioctx, clone_image, clone_name.c_str(), NULL));
+  ASSERT_EQ(0, clone_image.flatten());
+
+  librbd::RBD::AioCompletion *read_comp =
+    new librbd::RBD::AioCompletion(NULL, NULL);
+  bufferlist read_bl;
+  clone_image.aio_read(0, bl.length(), read_bl, read_comp);
+  ASSERT_EQ(0, read_comp->wait_for_complete());
+  ASSERT_EQ(bl.length(), read_comp->get_return_value());
+  read_comp->release();
+  ASSERT_TRUE(bl.contents_equal(read_bl));
+
+  ASSERT_PASSED(validate_object_map, clone_image);
+}
+
 TEST_F(TestLibRBD, SnapCreateViaLockOwner)
 {
   REQUIRE_FEATURE(RBD_FEATURE_LAYERING | RBD_FEATURE_EXCLUSIVE_LOCK);
@@ -2862,6 +2908,51 @@ TEST_F(TestLibRBD, FlushEmptyOpsOnExternalSnapshot) {
     new librbd::RBD::AioCompletion(NULL, NULL);
   bufferlist read_bl;
   image2.aio_read(0, 1024, read_bl, read_comp);
+  ASSERT_EQ(0, read_comp->wait_for_complete());
+  read_comp->release();
+}
+
+TEST_F(TestLibRBD, FlushCacheWithCopyupOnExternalSnapshot) {
+  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+
+  librados::IoCtx ioctx;
+  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+
+  librbd::RBD rbd;
+  librbd::Image image;
+  std::string name = get_temp_image_name();
+
+  uint64_t size = 1 << 18;
+  int order = 0;
+
+  ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), size, &order));
+  ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), NULL));
+
+  bufferlist bl;
+  bl.append(std::string(size, '1'));
+  ASSERT_EQ((int)size, image.write(0, size, bl));
+  ASSERT_EQ(0, image.snap_create("one"));
+  ASSERT_EQ(0, image.snap_protect("one"));
+
+  std::string clone_name = this->get_temp_image_name();
+  ASSERT_EQ(0, rbd.clone(ioctx, name.c_str(), "one", ioctx, clone_name.c_str(),
+                         RBD_FEATURE_LAYERING, &order));
+  ASSERT_EQ(0, rbd.open(ioctx, image, clone_name.c_str(), NULL));
+
+  librbd::Image image2;
+  ASSERT_EQ(0, rbd.open(ioctx, image2, clone_name.c_str(), NULL));
+
+  // prepare CoW writeback that will be flushed on next op
+  bl.clear();
+  bl.append(std::string(1, '1'));
+  ASSERT_EQ(0, image.flush());
+  ASSERT_EQ(1, image.write(0, 1, bl));
+  ASSERT_EQ(0, image2.snap_create("snap1"));
+
+  librbd::RBD::AioCompletion *read_comp =
+    new librbd::RBD::AioCompletion(NULL, NULL);
+  bufferlist read_bl;
+  image.aio_read(0, 1024, read_bl, read_comp);
   ASSERT_EQ(0, read_comp->wait_for_complete());
   read_comp->release();
 }

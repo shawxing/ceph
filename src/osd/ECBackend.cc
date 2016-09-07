@@ -361,7 +361,17 @@ void ECBackend::handle_recovery_read_complete(
     from[i->first.shard].claim(i->second);
   }
   dout(10) << __func__ << ": " << from << dendl;
-  ECUtil::decode(sinfo, ec_impl, from, target);
+  if (ECUtil::decode(sinfo, ec_impl, from, target) != 0) {
+    derr << __func__ << ": inconsistent shard sizes " << hoid << " "
+	 << " the offending shard must be manually removed "
+	 << " after verifying there are enough shards to recover "
+	 << "(" << to_read.get<0>()
+	 << ", " << to_read.get<1>()
+	 << ", " << to_read.get<2>()
+	 << ")"
+	 << dendl;
+    assert(0);
+  }
   if (attrs) {
     op.xattrs.swap(*attrs);
 
@@ -1580,7 +1590,6 @@ void ECBackend::start_write(Op *op) {
       op->on_local_applied_sync = 0;
     } else {
       MOSDECSubOpWrite *r = new MOSDECSubOpWrite(sop);
-      r->set_priority(cct->_conf->osd_client_op_priority);
       r->pgid = spg_t(get_parent()->primary_spg_t().pgid, i->shard);
       r->map_epoch = get_parent()->get_epoch();
       get_parent()->send_message_osd_cluster(
@@ -1716,7 +1725,7 @@ void ECBackend::objects_read_async(
 	c)));
 
   start_read_op(
-    cct->_conf->osd_client_op_priority,
+    CEPH_MSG_PRIO_DEFAULT,
     for_read_op,
     OpRequestRef());
   return;

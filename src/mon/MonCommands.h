@@ -634,7 +634,7 @@ COMMAND("osd pool get " \
 	"get pool parameter <var>", "osd", "r", "cli,rest")
 COMMAND("osd pool set " \
 	"name=pool,type=CephPoolname " \
-	"name=var,type=CephChoices,strings=size|min_size|crash_replay_interval|pg_num|pgp_num|crush_ruleset|hashpspool|nodelete|nopgchange|nosizechange|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|debug_fake_ec_pool|target_max_bytes|target_max_objects|cache_target_dirty_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|auid|min_read_recency_for_promote|write_fadvise_dontneed " \
+	"name=var,type=CephChoices,strings=size|min_size|crash_replay_interval|pg_num|pgp_num|crush_ruleset|hashpspool|nodelete|nopgchange|nosizechange|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|debug_fake_ec_pool|target_max_bytes|target_max_objects|cache_target_dirty_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|auid|min_read_recency_for_promote|write_fadvise_dontneed " \
 	"name=val,type=CephString " \
 	"name=force,type=CephChoices,strings=--yes-i-really-mean-it,req=false", \
 	"set pool parameter <var> to <val>", "osd", "rw", "cli,rest")
@@ -654,14 +654,36 @@ COMMAND("osd pool stats " \
         "name=name,type=CephString,req=false",
         "obtain stats from all pools, or from specified pool",
         "osd", "r", "cli,rest")
+COMMAND("osd utilization",
+	"get basic pg distribution stats",
+	"osd", "r", "cli,rest")
 COMMAND("osd reweight-by-utilization " \
-	"name=oload,type=CephInt,range=100,req=false", \
+	"name=oload,type=CephInt,req=false " \
+	"name=max_change,type=CephFloat,req=false "			\
+	"name=max_osds,type=CephInt,req=false "			\
+	"name=no_increasing,type=CephChoices,strings=--no-increasing,req=false",\
 	"reweight OSDs by utilization [overload-percentage-for-consideration, default 120]", \
 	"osd", "rw", "cli,rest")
+COMMAND("osd test-reweight-by-utilization " \
+	"name=oload,type=CephInt,req=false " \
+	"name=max_change,type=CephFloat,req=false "			\
+	"name=max_osds,type=CephInt,req=false "			\
+	"name=no_increasing,type=CephChoices,strings=--no-increasing,req=false",\
+	"dry run of reweight OSDs by utilization [overload-percentage-for-consideration, default 120]", \
+	"osd", "rw", "cli,rest")
 COMMAND("osd reweight-by-pg " \
-	"name=oload,type=CephInt,range=100 " \
-	"name=pools,type=CephPoolname,n=N,req=false", \
+	"name=oload,type=CephInt,req=false " \
+	"name=max_change,type=CephFloat,req=false "			\
+	"name=max_osds,type=CephInt,req=false "			\
+	"name=pools,type=CephPoolname,n=N,req=false",			\
 	"reweight OSDs by PG distribution [overload-percentage-for-consideration, default 120]", \
+	"osd", "rw", "cli,rest")
+COMMAND("osd test-reweight-by-pg " \
+	"name=oload,type=CephInt,req=false " \
+	"name=max_change,type=CephFloat,req=false "			\
+	"name=max_osds,type=CephInt,req=false "			\
+	"name=pools,type=CephPoolname,n=N,req=false",			\
+	"dry run of reweight OSDs by PG distribution [overload-percentage-for-consideration, default 120]", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd thrash " \
 	"name=num_epochs,type=CephInt,range=0", \

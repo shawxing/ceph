@@ -634,6 +634,18 @@ bool RGWOp::generate_cors_headers(string& origin, string& method, string& header
   if (!rule)
     return false;
 
+  /*
+   * Set the Allowed-Origin header to a asterisk if this is allowed in the rule
+   * and no Authorization was send by the client
+   *
+   * The origin parameter specifies a URI that may access the resource.  The browser must enforce this.
+   * For requests without credentials, the server may specify "*" as a wildcard,
+   * thereby allowing any origin to access the resource.
+   */
+  const char *authorization = s->info.env->get("HTTP_AUTHORIZATION");
+  if (!authorization && rule->has_wildcard_origin())
+    origin = "*";
+
   /* CORS 6.2.3. */
   const char *req_meth = s->info.env->get("HTTP_ACCESS_CONTROL_REQUEST_METHOD");
   if (!req_meth) {
@@ -942,6 +954,7 @@ void RGWGetObj::execute()
     ret = handle_user_manifest(attr_iter->second.c_str());
     if (ret < 0) {
       ldout(s->cct, 0) << "ERROR: failed to handle user manifest ret=" << ret << dendl;
+      goto done_err;
     }
     return;
   }
@@ -1471,6 +1484,11 @@ void RGWDeleteBucket::execute()
     }
   }
 
+  ret = rgw_bucket_sync_user_stats(store, s->user.user_id, s->bucket);
+  if ( ret < 0) {
+     ldout(s->cct, 1) << "WARNING: failed to sync user stats before bucket delete: ret= " << ret << dendl;
+  }
+
   ret = store->delete_bucket(s->bucket, ot);
 
   if (ret == 0) {
@@ -1684,12 +1702,13 @@ static int put_data_and_throttle(RGWPutObjProcessor *processor, bufferlist& data
 
   do {
     void *handle;
+    rgw_obj obj;
 
-    int ret = processor->handle_data(data, ofs, hash, &handle, &again);
+    int ret = processor->handle_data(data, ofs, hash, &handle, &obj, &again);
     if (ret < 0)
       return ret;
 
-    ret = processor->throttle_data(handle, need_to_wait);
+    ret = processor->throttle_data(handle, obj, need_to_wait);
     if (ret < 0)
       return ret;
 
@@ -2433,6 +2452,7 @@ void RGWCopyObj::execute()
                         if_match,
                         if_nomatch,
                         attrs_mod,
+                        copy_if_newer,
                         attrs, RGW_OBJ_CATEGORY_MAIN,
                         olh_epoch,
                         (version_id.empty() ? NULL : &version_id),

@@ -158,8 +158,18 @@ void PGPool::update(OSDMapRef map)
   name = map->get_pool_name(id);
   if (pi->get_snap_epoch() == map->get_epoch()) {
     pi->build_removed_snaps(newly_removed_snaps);
-    newly_removed_snaps.subtract(cached_removed_snaps);
-    cached_removed_snaps.union_of(newly_removed_snaps);
+    interval_set<snapid_t> intersection;
+    intersection.intersection_of(newly_removed_snaps, cached_removed_snaps);
+    if (intersection == cached_removed_snaps) {
+        newly_removed_snaps.subtract(cached_removed_snaps);
+        cached_removed_snaps.union_of(newly_removed_snaps);
+    } else {
+        lgeneric_subdout(g_ceph_context, osd, 0) << __func__
+          << " cached_removed_snaps shrank from " << cached_removed_snaps
+          << " to " << newly_removed_snaps << dendl;
+        cached_removed_snaps = newly_removed_snaps;
+        newly_removed_snaps.clear();
+    }
     snapc = pi->get_snap_context();
   } else {
     newly_removed_snaps.clear();
@@ -647,7 +657,12 @@ bool PG::needs_backfill() const
 
 bool PG::_calc_past_interval_range(epoch_t *start, epoch_t *end, epoch_t oldest_map)
 {
-  *end = info.history.same_interval_since;
+  if (info.history.same_interval_since) {
+    *end = info.history.same_interval_since;
+  } else {
+    // PG must be imported, so let's calculate the whole range.
+    *end = osdmap_ref->get_epoch();
+  }
 
   // Do we already have the intervals we want?
   map<epoch_t,pg_interval_t>::const_iterator pif = past_intervals.begin();
@@ -678,6 +693,8 @@ void PG::generate_past_intervals()
   epoch_t cur_epoch, end_epoch;
   if (!_calc_past_interval_range(&cur_epoch, &end_epoch,
       osd->get_superblock().oldest_map)) {
+    if (info.history.same_interval_since == 0)
+      info.history.same_interval_since = end_epoch;
     return;
   }
 
@@ -730,6 +747,15 @@ void PG::generate_past_intervals()
       dout(10) << debug.str() << dendl;
       same_interval_since = cur_epoch;
     }
+  }
+
+  // PG import needs recalculated same_interval_since
+  if (info.history.same_interval_since == 0) {
+    assert(same_interval_since);
+    dout(10) << __func__ << " fix same_interval_since " << same_interval_since << " pg " << *this << dendl;
+    dout(10) << __func__ << " past_intervals " << past_intervals << dendl;
+    // Fix it
+    info.history.same_interval_since = same_interval_since;
   }
 
   // record our work.
@@ -1550,7 +1576,16 @@ void PG::activate(ObjectStore::Transaction& t,
     dout(20) << "activate - purged_snaps " << info.purged_snaps
 	     << " cached_removed_snaps " << pool.cached_removed_snaps << dendl;
     snap_trimq = pool.cached_removed_snaps;
-    snap_trimq.subtract(info.purged_snaps);
+    interval_set<snapid_t> intersection;
+    intersection.intersection_of(snap_trimq, info.purged_snaps);
+    if (intersection == info.purged_snaps) {
+      snap_trimq.subtract(info.purged_snaps);
+    } else {
+        dout(0) << "warning: info.purged_snaps (" << info.purged_snaps
+                << ") is not a subset of pool.cached_removed_snaps ("
+                << pool.cached_removed_snaps << ")" << dendl;
+        snap_trimq.subtract(intersection);
+    }
     dout(10) << "activate - snap_trimq " << snap_trimq << dendl;
     if (!snap_trimq.empty() && is_clean())
       queue_snap_trim();
@@ -2153,10 +2188,12 @@ void PG::split_into(pg_t child_pgid, PG *child, unsigned split_bits)
 
   // Info
   child->info.history = info.history;
+  child->info.history.epoch_created = get_osdmap()->get_epoch();
   child->info.purged_snaps = info.purged_snaps;
   child->info.last_backfill = info.last_backfill;
 
   child->info.stats = info.stats;
+  child->info.stats.parent_split_bits = split_bits;
   info.stats.stats_invalid = true;
   child->info.stats.stats_invalid = true;
   child->info.last_epoch_started = info.last_epoch_started;
@@ -2178,6 +2215,12 @@ void PG::split_into(pg_t child_pgid, PG *child, unsigned split_bits)
   // this comparison includes primary rank via pg_shard_t
   if (get_primary() != child->get_primary())
     child->info.history.same_primary_since = get_osdmap()->get_epoch();
+
+  child->info.stats.up = up;
+  child->info.stats.up_primary = up_primary;
+  child->info.stats.acting = acting;
+  child->info.stats.acting_primary = primary;
+  child->info.stats.mapping_epoch = get_osdmap()->get_epoch();
 
   // History
   child->past_intervals = past_intervals;
@@ -3600,8 +3643,18 @@ void PG::_scan_snaps(ScrubMap &smap)
     if (hoid.snap < CEPH_MAXSNAP) {
       // fake nlinks for old primaries
       bufferlist bl;
+      if (o.attrs.find(OI_ATTR) == o.attrs.end()) {
+	o.nlinks = 0;
+	continue;
+      }
       bl.push_back(o.attrs[OI_ATTR]);
-      object_info_t oi(bl);
+      object_info_t oi;
+      try {
+	oi = bl;
+      } catch(...) {
+	o.nlinks = 0;
+	continue;
+      }
       if (oi.snaps.empty()) {
 	// Just head
 	o.nlinks = 1;
@@ -3715,15 +3768,20 @@ void PG::repair_object(
     assert(waiting_for_unreadable_object.empty());
 
     pg_log.missing_add(soid, oi.version, eversion_t());
-    missing_loc.add_missing(soid, oi.version, eversion_t());
-    list<pair<ScrubMap::object, pg_shard_t> >::iterator i;
-    for (i = ok_peers->begin();
-	 i != ok_peers->end();
-	 ++i)
-      missing_loc.add_location(soid, i->second);
 
     pg_log.set_last_requested(0);
     dout(10) << __func__ << ": primary = " << primary << dendl;
+  }
+
+  if (is_ec_pg() || bad_peer == primary) {
+    // we'd better collect all shard for EC pg, and prepare good peers as the
+    // source of pull in the case of replicated pg.
+    missing_loc.add_missing(soid, oi.version, eversion_t());
+    list<pair<ScrubMap::object, pg_shard_t> >::iterator i;
+    for (i = ok_peers->begin();
+	i != ok_peers->end();
+	++i)
+      missing_loc.add_location(soid, i->second);
   }
 }
 
@@ -4759,6 +4817,7 @@ void PG::start_peering_interval(
     info.history.same_interval_since = osdmap->get_epoch();
   } else {
     std::stringstream debug;
+    assert(info.history.same_interval_since != 0);
     boost::scoped_ptr<IsPGRecoverablePredicate> recoverable(
       get_is_recoverable_predicate());
     bool new_interval = pg_interval_t::check_new_interval(

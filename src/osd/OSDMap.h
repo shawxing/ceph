@@ -293,6 +293,9 @@ public:
     pg_temp.reset(new map<pg_t,vector<int32_t> >(*o.pg_temp));
     osd_uuid.reset(new vector<uuid_d>(*o.osd_uuid));
 
+    if (o.osd_primary_affinity)
+      osd_primary_affinity.reset(new vector<__u32>(*o.osd_primary_affinity));
+
     // NOTE: this still references shared entity_addr_t's.
     osd_addrs.reset(new addrs_s(*o.osd_addrs));
 
@@ -768,6 +771,15 @@ public:
       return group[group.size()-1];
     return -1;  // we fail!
   }
+  bool is_acting_osd_shard(pg_t pg, int osd, shard_id_t shard) const {
+    vector<int> acting;
+    int nrep = pg_to_acting_osds(pg, acting);
+    if (shard == shard_id_t::NO_SHARD)
+      return calc_pg_role(osd, acting, nrep) >= 0;
+    if (shard >= (int)acting.size())
+      return false;
+    return acting[shard] == osd;
+  }
 
 
   /* what replica # is a given osd? 0 primary, -1 for none. */
@@ -847,6 +859,12 @@ public:
   void print_summary(Formatter *f, ostream& out) const;
   void print_oneline_summary(ostream& out) const;
   void print_tree(ostream *out, Formatter *f) const;
+
+  int summarize_mapping_stats(
+    OSDMap *newmap,
+    const set<int64_t> *pools,
+    std::string *out,
+    Formatter *f) const;
 
   string get_flag_string() const;
   static string get_flag_string(unsigned flags);

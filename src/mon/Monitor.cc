@@ -178,6 +178,7 @@ Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
 
   timecheck_round(0),
   timecheck_acks(0),
+  timecheck_rounds_since_clean(0),
   timecheck_event(NULL),
 
   probe_timeout_event(NULL),
@@ -1021,7 +1022,9 @@ set<string> Monitor::get_sync_targets_names()
   targets.insert(paxos->get_name());
   for (int i = 0; i < PAXOS_NUM; ++i)
     paxos_service[i]->get_store_prefixes(targets);
-
+  ConfigKeyService *config_key_service_ptr = dynamic_cast<ConfigKeyService*>(config_key_service);
+  assert(config_key_service_ptr);
+  config_key_service_ptr->get_store_prefixes(targets);
   return targets;
 }
 
@@ -1692,7 +1695,7 @@ void Monitor::handle_probe_reply(MMonProbe *m)
   } else {
     if (paxos->get_version() < m->paxos_first_version &&
 	m->paxos_first_version > 1) {  // no need to sync if we're 0 and they start at 1.
-      dout(10) << " peer paxos versions [" << m->paxos_first_version
+      dout(10) << " peer paxos first versions [" << m->paxos_first_version
 	       << "," << m->paxos_last_version << "]"
 	       << " vs my version " << paxos->get_version()
 	       << " (too far ahead)"
@@ -1703,7 +1706,7 @@ void Monitor::handle_probe_reply(MMonProbe *m)
       return;
     }
     if (paxos->get_version() + g_conf->paxos_max_join_drift < m->paxos_last_version) {
-      dout(10) << " peer paxos version " << m->paxos_last_version
+      dout(10) << " peer paxos last version " << m->paxos_last_version
 	       << " vs my version " << paxos->get_version()
 	       << " (too far ahead)"
 	       << dendl;
@@ -2562,7 +2565,19 @@ void Monitor::handle_command(MMonCommand *m)
     return;
   }
 
-  cmd_getval(g_ceph_context, cmdmap, "prefix", prefix);
+  // check return value. If no prefix parameter provided,
+  // return value will be false, then return error info.
+  if(!cmd_getval(g_ceph_context, cmdmap, "prefix", prefix)) {
+    reply_command(m, -EINVAL, "command prefix not found", 0);
+    return;
+  }
+
+  // check prefix is empty
+  if (prefix.empty()) {
+    reply_command(m, -EINVAL, "command prefix must not be empty", 0);
+    return;
+  }
+
   if (prefix == "get_command_descriptions") {
     bufferlist rdata;
     Formatter *f = Formatter::create("json");
@@ -2583,6 +2598,15 @@ void Monitor::handle_command(MMonCommand *m)
   boost::scoped_ptr<Formatter> f(Formatter::create(format));
 
   get_str_vec(prefix, fullcmd);
+
+  // make sure fullcmd is not empty.
+  // invalid prefix will cause empty vector fullcmd.
+  // such as, prefix=";,,;"
+  if (fullcmd.empty()) {
+    reply_command(m, -EINVAL, "command requires a prefix to be valid", 0);
+    return;
+  }
+
   module = fullcmd[0];
 
   // validate command is in leader map
@@ -3683,8 +3707,7 @@ void Monitor::timecheck_start_round()
   timecheck();
 out:
   dout(10) << __func__ << " setting up next event" << dendl;
-  timecheck_event = new C_TimeCheck(this);
-  timer.add_event_after(g_conf->mon_timecheck_interval, timecheck_event);
+  timecheck_reset_event();
 }
 
 void Monitor::timecheck_finish_round(bool success)
@@ -3698,6 +3721,7 @@ void Monitor::timecheck_finish_round(bool success)
     assert(timecheck_waiting.empty());
     assert(timecheck_acks == quorum.size());
     timecheck_report();
+    timecheck_check_skews();
     return;
   }
 
@@ -3731,6 +3755,69 @@ void Monitor::timecheck_cleanup()
   timecheck_waiting.clear();
   timecheck_skews.clear();
   timecheck_latencies.clear();
+
+  timecheck_rounds_since_clean = 0;
+}
+
+void Monitor::timecheck_reset_event()
+{
+  if (timecheck_event) {
+    timer.cancel_event(timecheck_event);
+    timecheck_event = NULL;
+  }
+
+  double delay =
+    cct->_conf->mon_timecheck_skew_interval * timecheck_rounds_since_clean;
+
+  if (delay <= 0 || delay > cct->_conf->mon_timecheck_interval) {
+    delay = cct->_conf->mon_timecheck_interval;
+  }
+
+  dout(10) << __func__ << " delay " << delay
+           << " rounds_since_clean " << timecheck_rounds_since_clean
+           << dendl;
+
+  timecheck_event = new C_TimeCheck(this);
+  timer.add_event_after(delay, timecheck_event);
+}
+
+void Monitor::timecheck_check_skews()
+{
+  dout(10) << __func__ << dendl;
+  assert(is_leader());
+  assert((timecheck_round % 2) == 0);
+  if (monmap->size() == 1) {
+    assert(0 == "We are alone; we shouldn't have gotten here!");
+    return;
+  }
+  assert(timecheck_latencies.size() == timecheck_skews.size());
+
+  bool found_skew = false;
+  for (map<entity_inst_t, double>::iterator p = timecheck_skews.begin();
+       p != timecheck_skews.end(); ++p) {
+
+    double abs_skew;
+    if (timecheck_has_skew(p->second, &abs_skew)) {
+      dout(10) << __func__
+               << " " << p->first << " skew " << abs_skew << dendl;
+      found_skew = true;
+    }
+  }
+
+  if (found_skew) {
+    ++timecheck_rounds_since_clean;
+    timecheck_reset_event();
+  } else if (timecheck_rounds_since_clean > 0) {
+    dout(1) << __func__
+      << " no clock skews found after " << timecheck_rounds_since_clean
+      << " rounds" << dendl;
+    // make sure the skews are really gone and not just a transient success
+    // this will run just once if not in the presence of skews again.
+    timecheck_rounds_since_clean = 1;
+    timecheck_reset_event();
+    timecheck_rounds_since_clean = 0;
+  }
+
 }
 
 void Monitor::timecheck_report()
@@ -3753,7 +3840,8 @@ void Monitor::timecheck_report()
     m->epoch = get_epoch();
     m->round = timecheck_round;
 
-    for (map<entity_inst_t, double>::iterator it = timecheck_skews.begin(); it != timecheck_skews.end(); ++it) {
+    for (map<entity_inst_t, double>::iterator it = timecheck_skews.begin();
+         it != timecheck_skews.end(); ++it) {
       double skew = it->second;
       double latency = timecheck_latencies[it->first];
 
@@ -3812,10 +3900,10 @@ health_status_t Monitor::timecheck_status(ostringstream &ss,
                                           const double latency)
 {
   health_status_t status = HEALTH_OK;
-  double abs_skew = (skew_bound > 0 ? skew_bound : -skew_bound);
   assert(latency >= 0);
 
-  if (abs_skew > g_conf->mon_clock_drift_allowed) {
+  double abs_skew;
+  if (timecheck_has_skew(skew_bound, &abs_skew)) {
     status = HEALTH_WARN;
     ss << "clock skew " << abs_skew << "s"
        << " > max " << g_conf->mon_clock_drift_allowed << "s";
@@ -3929,11 +4017,7 @@ void Monitor::handle_timecheck_leader(MTimeCheck *m)
 	   << " delta " << delta << " skew_bound " << skew_bound
 	   << " latency " << latency << dendl;
 
-  if (timecheck_skews.count(other) == 0) {
-    timecheck_skews[other] = skew_bound;
-  } else {
-    timecheck_skews[other] = (timecheck_skews[other]*0.8)+(skew_bound*0.2);
-  }
+  timecheck_skews[other] = skew_bound;
 
   timecheck_acks++;
   if (timecheck_acks == quorum.size()) {
@@ -4544,7 +4628,7 @@ int Monitor::write_default_keyring(bufferlist& bl)
   os << g_conf->mon_data << "/keyring";
 
   int err = 0;
-  int fd = ::open(os.str().c_str(), O_WRONLY|O_CREAT, 0644);
+  int fd = ::open(os.str().c_str(), O_WRONLY|O_CREAT, 0600);
   if (fd < 0) {
     err = -errno;
     dout(0) << __func__ << " failed to open " << os.str() 
