@@ -463,10 +463,16 @@ void OSDMonitor::update_logger()
 }
 
 struct Sorter {
-  bool operator()(std::pair<int,float> l,
-		  std::pair<int,float> r) {
-    return l.second > r.second;
-  }
+
+    double average_util; 
+
+    Sorter(const double average_util_)
+     : average_util(average_util_)
+    {}
+
+    bool operator()(std::pair<int,float> l, std::pair<int,float> r) {
+        return abs(l.second - average_util) > abs(r.second - average_util);
+    }
 };
 
 /* Assign a lower weight to overloaded OSDs.
@@ -595,8 +601,9 @@ int OSDMonitor::reweight_by_utilization(int oload,
     util_by_osd.push_back(osd_util);
   }
 
-  // sort and iterate from most to least utilized
-  std::sort(util_by_osd.begin(), util_by_osd.end(), Sorter());
+  // sort by absolute deviation from the mean utilization,
+  // in descending order.
+  std::sort(util_by_osd.begin(), util_by_osd.end(), Sorter(average_util));
 
   OSDMap::Incremental newinc;
 
@@ -1487,6 +1494,13 @@ void OSDMonitor::check_failures(utime_t now)
 
 bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 {
+  // already pending failure?
+  if (pending_inc.new_state.count(target_osd) &&
+      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
+    dout(10) << " already pending failure" << dendl;
+    return true;
+  }
+
   utime_t orig_grace(g_conf->osd_heartbeat_grace, 0);
   utime_t max_failed_since = fi.get_failed_since();
   utime_t failed_for = now - max_failed_since;
@@ -1529,13 +1543,6 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 	   << fi.num_reports << " reports, "
 	   << grace << " grace (" << orig_grace << " + " << my_grace << " + " << peer_grace << "), max_failed_since " << max_failed_since
 	   << dendl;
-
-  // already pending failure?
-  if (pending_inc.new_state.count(target_osd) &&
-      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
-    dout(10) << " already pending failure" << dendl;
-    return true;
-  }
 
   if (failed_for >= grace &&
       ((int)fi.reporters.size() >= g_conf->mon_osd_min_down_reporters) &&
@@ -2024,6 +2031,21 @@ bool OSDMonitor::preprocess_pgtemp(MOSDPGTemp *m)
        */
       dout(10) << __func__ << " ignore " << p->first << " -> " << p->second
                << ": pool has been removed" << dendl;
+      ignore_cnt++;
+      continue;
+    }
+
+    int acting_primary = -1;
+    osdmap.pg_to_up_acting_osds(
+      p->first, NULL, NULL, NULL, &acting_primary);
+    if (acting_primary != from) {
+      /* If the source isn't the primary based on the current osdmap, we know
+       * that the interval changed and that we can discard this message.
+       * Indeed, we must do so to avoid 16127 since we can't otherwise determine
+       * which of two pg temp mappings on the same pg is more recent.
+       */
+      dout(10) << __func__ << " ignore " << p->first << " -> " << p->second
+	       << ": primary has changed" << dendl;
       ignore_cnt++;
       continue;
     }
@@ -3639,8 +3661,8 @@ void OSDMonitor::get_pools_health(
 	detail->push_back(make_pair(HEALTH_WARN, ss.str()));
     }
 
-    float warn_threshold = g_conf->mon_pool_quota_warn_threshold/100;
-    float crit_threshold = g_conf->mon_pool_quota_crit_threshold/100;
+    float warn_threshold = (float)g_conf->mon_pool_quota_warn_threshold/100;
+    float crit_threshold = (float)g_conf->mon_pool_quota_crit_threshold/100;
 
     if (pool.quota_max_objects > 0) {
       stringstream ss;

@@ -1471,6 +1471,12 @@ function test_osd_bench()
   ceph tell osd.0 bench 104857600 2097152
 }
 
+function test_osd_negative_filestore_merge_threshold()
+{
+  $SUDO ceph daemon osd.0 config set filestore_merge_threshold -1
+  expect_config_value "osd.0" "filestore_merge_threshold" -1
+}
+
 function test_mon_tell()
 {
   ceph tell mon.a version
@@ -1519,6 +1525,30 @@ EOF
   ceph osd setcrushmap -i $map
 }
 
+function test_mon_cephdf_commands()
+{
+  # ceph df detail:
+  # pool section:
+  # RAW USED The near raw used per pool in raw total
+
+  ceph osd pool create cephdf_for_test 32 32 replicated
+  ceph osd pool set cephdf_for_test size 2
+
+  dd if=/dev/zero of=./cephdf_for_test bs=4k count=1
+  rados put cephdf_for_test cephdf_for_test -p cephdf_for_test
+
+  #wait for update
+  sleep 10
+
+  cal_raw_used_size=`ceph df detail | grep cephdf_for_test | awk -F ' ' '{printf "%d\n", 2 * $4}'`
+  raw_used_size=`ceph df detail | grep cephdf_for_test | awk -F ' '  '{print $11}'`
+
+  ceph osd pool delete cephdf_for_test cephdf_for_test --yes-i-really-really-mean-it
+  rm ./cephdf_for_test
+
+  expect_false test $cal_raw_used_size != $raw_used_size
+}
+
 #
 # New tests should be added to the TESTS array below
 #
@@ -1554,8 +1584,10 @@ MON_TESTS+=" mon_osd_misc"
 MON_TESTS+=" mon_heap_profiler"
 MON_TESTS+=" mon_tell"
 MON_TESTS+=" mon_crushmap_validation"
+MON_TESTS+=" mon_cephdf_commands"
 
 OSD_TESTS+=" osd_bench"
+OSD_TESTS+=" osd_negative_filestore_merge_threshold"
 OSD_TESTS+=" tiering_agent"
 
 MDS_TESTS+=" mds_tell"
