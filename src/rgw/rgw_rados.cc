@@ -1113,17 +1113,8 @@ int RGWPutObjProcessor_Atomic::handle_data(bufferlist& bl, off_t ofs, MD5 *hash,
   data_ofs = write_ofs + bl.length();
   bool exclusive = (!write_ofs && immutable_head()); /* immutable head object, need to verify nothing exists there
                                                         we could be racing with another upload, to the same
-<<<<<<< HEAD
                                                         object and cleanup can be messy *///第一次的multipart写需要排他，防止与其他上传竞争
-//  if (hash) {
-//    hash->Update((const byte *)bl.c_str(), bl.length());
-//  }
-
-  int ret = write_data(bl, write_ofs, phandle, exclusive);
-=======
-                                                        object and cleanup can be messy */
   int ret = write_data(bl, write_ofs, phandle, pobj, exclusive);
->>>>>>> v0.94.9
   if (ret >= 0) { /* we might return, need to clear bl as it was already sent */
 	  bl.clear();
   }
@@ -1201,11 +1192,7 @@ int RGWPutObjProcessor_Atomic::complete_writing_data()
     first_chunk.claim(pending_data_bl);
     obj_len = (uint64_t)first_chunk.length();
   }
-<<<<<<< HEAD
-  if (pending_data_bl.length()) {//处理最后小于512k的数据
-=======
   while (pending_data_bl.length()) {
->>>>>>> v0.94.9
     void *handle;
     uint64_t max_write_size = MIN(max_chunk_size, (uint64_t)next_part_ofs - data_ofs);
     if (max_write_size > pending_data_bl.length()) {
