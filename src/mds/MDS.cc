@@ -242,9 +242,13 @@ bool MDS::asok_command(string command, cmdmap_t& cmdmap, string format,
       f->dump_string("error", "mds_not_active");
     } else if (command == "dump_ops_in_flight" ||
 	       command == "ops") {
-      op_tracker.dump_ops_in_flight(f);
+      if (!op_tracker.dump_ops_in_flight(f)) {
+        ss << "op_tracker tracking is not enabled";
+      }
     } else if (command == "dump_historic_ops") {
-      op_tracker.dump_historic_ops(f);
+      if (!op_tracker.dump_historic_ops(f)) {
+	ss << "op_tracker tracking is not enabled";
+      }
     } else if (command == "osdmap barrier") {
       int64_t target_epoch = 0;
       bool got_val = cmd_getval(g_ceph_context, cmdmap, "target_epoch", target_epoch);
@@ -2445,7 +2449,7 @@ bool MDS::ms_dispatch(Message *m)
     ret = true;
   } else {
     inc_dispatch_depth();
-    ret = _dispatch(m);
+    ret = _dispatch(m, true);
     dec_dispatch_depth();
   }
   mds_lock.Unlock();
@@ -2674,7 +2678,7 @@ void MDS::_advance_queues()
 
 /* If this function returns true, it has put the message. If it returns false,
  * it has not put the message. */
-bool MDS::_dispatch(Message *m)
+bool MDS::_dispatch(Message *m, bool new_msg)
 {
   if (is_stale_message(m)) {
     m->put();
@@ -2685,6 +2689,9 @@ bool MDS::_dispatch(Message *m)
   if (!handle_core_message(m)) {
     if (beacon.is_laggy()) {
       dout(10) << " laggy, deferring " << *m << dendl;
+      waiting_for_nolaggy.push_back(m);
+    } else if (new_msg && !waiting_for_nolaggy.empty()) {
+      dout(10) << " there are deferred messages, deferring " << *m << dendl;
       waiting_for_nolaggy.push_back(m);
     } else {
       if (!handle_deferrable_message(m)) {

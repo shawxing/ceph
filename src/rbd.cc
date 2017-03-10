@@ -2912,7 +2912,6 @@ if (!set_conf_param(v, p1, p2, p3)) { \
 
   if (opt_cmd != OPT_LIST &&
       opt_cmd != OPT_IMPORT &&
-      opt_cmd != OPT_IMPORT_DIFF &&
       opt_cmd != OPT_UNMAP &&
       opt_cmd != OPT_SHOWMAPPED &&
       opt_cmd != OPT_MERGE_DIFF && !imgname) {
@@ -3048,7 +3047,7 @@ if (!set_conf_param(v, p1, p2, p3)) { \
        opt_cmd == OPT_STATUS)) {
 
     if (opt_cmd == OPT_INFO || opt_cmd == OPT_SNAP_LIST ||
-	opt_cmd == OPT_EXPORT || opt_cmd == OPT_EXPORT || opt_cmd == OPT_COPY ||
+	opt_cmd == OPT_EXPORT || opt_cmd == OPT_EXPORT_DIFF || opt_cmd == OPT_COPY ||
 	opt_cmd == OPT_CHILDREN || opt_cmd == OPT_LOCK_LIST ||
         opt_cmd == OPT_STATUS || opt_cmd == OPT_WATCH) {
       r = rbd.open_read_only(io_ctx, image, imgname, NULL);

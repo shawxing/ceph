@@ -87,6 +87,23 @@ int prepare_image_update(ImageCtx *ictx) {
   return r;
 }
 
+void acquire_lock(ImageCtx *ictx) {
+  assert(ictx->owner_lock.is_locked());
+  AioCompletion *comp = aio_create_completion();
+  comp->add_request();
+  comp->finish_adding_requests(ictx->cct);
+
+  ictx->image_watcher->request_lock(
+    boost::bind(&AioCompletion::complete_request, _1, ictx->cct, 0),
+    comp);
+
+  ictx->owner_lock.put_read();
+  int r = comp->wait_for_complete();
+  assert(r == 0);
+  comp->release();
+  ictx->owner_lock.get_read();
+}
+
 int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
                          bool permit_snapshot,
                          const boost::function<int(Context*)>& local_request,
@@ -104,15 +121,25 @@ int invoke_async_request(ImageCtx *ictx, const std::string& request_type,
         }
       }
 
+      bool request_lock = false;
       while (ictx->image_watcher->is_lock_supported()) {
+        if (request_lock) {
+          acquire_lock(ictx);
+        }
         r = prepare_image_update(ictx);
         if (r < 0) {
           return -EROFS;
         } else if (ictx->image_watcher->is_lock_owner()) {
           break;
+        } else if (request_lock) {
+          return -EOPNOTSUPP;
         }
 
         r = remote_request();
+        if (r == -EOPNOTSUPP) {
+          request_lock = true;
+          continue;
+        }
         if (r != -ETIMEDOUT && r != -ERESTART) {
           return r;
         }
@@ -252,9 +279,10 @@ int validate_pool(IoCtx &io_ctx, CephContext *cct) {
     info.obj_size = 1ULL << obj_order;
     info.num_objs = Striper::get_num_objects(ictx->layout, info.size);
     info.order = obj_order;
-    memcpy(&info.block_name_prefix, ictx->object_prefix.c_str(),
-	   min((size_t)RBD_MAX_BLOCK_NAME_SIZE,
-	       ictx->object_prefix.length() + 1));
+    strncpy(info.block_name_prefix, ictx->object_prefix.c_str(),
+            RBD_MAX_BLOCK_NAME_SIZE);
+    info.block_name_prefix[RBD_MAX_BLOCK_NAME_SIZE - 1] = '\0';
+
     // clear deprecated fields
     info.parent_pool = -1L;
     info.parent_name[0] = '\0';
@@ -1029,6 +1057,14 @@ reprotect_and_return_err:
     extra = rand() % 0xFFFFFFFF;
     bid_ss << std::hex << bid << std::hex << extra;
     id = bid_ss.str();
+
+    // ensure the image id won't overflow the fixed block name size
+    const size_t max_id_length = RBD_MAX_BLOCK_NAME_SIZE -
+                                 strlen(RBD_DATA_PREFIX) - 1;
+    if (id.length() > max_id_length) {
+      id = id.substr(id.length() - max_id_length);
+    }
+
     r = cls_client::set_id(&io_ctx, id_obj, id);
     if (r < 0) {
       lderr(cct) << "error setting image id: " << cpp_strerror(r) << dendl;
@@ -3029,8 +3065,20 @@ reprotect_and_return_err:
 
 	librados::snap_set_t snap_set;
 	int r = head_ctx.list_snaps(p->first.name, &snap_set);
-	if (r == -ENOENT) {
-	  if (from_snap_id == 0 && !parent_diff.empty()) {
+	if (r < 0 && r != -ENOENT) {
+	  return r;
+	}
+
+	// calc diff from from_snap_id -> to_snap_id
+	interval_set<uint64_t> diff;
+	bool end_exists = false;
+	if (!snap_set.clones.empty()) {
+	  calc_snap_set_diff(ictx->cct, snap_set, from_snap_id, end_snap_id,
+			     &diff, &end_exists);
+	  ldout(ictx->cct, 20) << "  diff " << diff << " end_exists=" << end_exists << dendl;
+	}
+	if (diff.empty()) {
+	  if (from_snap_id == 0 && !parent_diff.empty() && !end_exists) {
 	    // report parent diff instead
 	    for (vector<ObjectExtent>::iterator q = p->second.begin(); q != p->second.end(); ++q) {
 	      for (vector<pair<uint64_t,uint64_t> >::iterator r = q->buffer_extents.begin();
@@ -3048,19 +3096,6 @@ reprotect_and_return_err:
 	  }
 	  continue;
 	}
-	if (r < 0)
-	  return r;
-
-	// calc diff from from_snap_id -> to_snap_id
-	interval_set<uint64_t> diff;
-	bool end_exists;
-	calc_snap_set_diff(ictx->cct, snap_set,
-			   from_snap_id,
-			   end_snap_id,
-			   &diff, &end_exists);
-	ldout(ictx->cct, 20) << "  diff " << diff << " end_exists=" << end_exists << dendl;
-	if (diff.empty())
-	  continue;
 
 	for (vector<ObjectExtent>::iterator q = p->second.begin(); q != p->second.end(); ++q) {
 	  ldout(ictx->cct, 20) << "diff_iterate object " << p->first

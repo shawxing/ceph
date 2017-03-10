@@ -76,6 +76,8 @@ void MonmapMonitor::update_from_paxos(bool *need_bootstrap)
     t->erase("mkfs", "monmap");
     mon->store->apply_transaction(t);
   }
+
+  check_subs();
 }
 
 void MonmapMonitor::create_pending()
@@ -373,6 +375,7 @@ bool MonmapMonitor::prepare_command(MMonCommand *m)
     pending_map.remove(name);
     pending_map.last_changed = ceph_clock_now(g_ceph_context);
     ss << "removed mon." << name << " at " << addr << ", there are now " << pending_map.size() << " monitors" ;
+    err = 0;
     getline(ss, rs);
     // send reply immediately in case we get removed
     mon->reply_command(m, 0, rs, get_last_committed());
@@ -501,4 +504,33 @@ int MonmapMonitor::get_monmap(MonMap &m)
   }
   m.decode(monmap_bl);
   return 0;
+}
+
+void MonmapMonitor::check_subs()
+{
+  dout(10) << __func__ << dendl;
+  const string type = "monmap";
+  if (mon->session_map.subs.count(type) == 0)
+    return;
+  xlist<Subscription*>::iterator p = mon->session_map.subs[type]->begin();
+  while (!p.end()) {
+    Subscription *sub = *p;
+    ++p;
+    check_sub(sub);
+  }
+}
+
+void MonmapMonitor::check_sub(Subscription *sub)
+{
+  const epoch_t epoch = mon->monmap->get_epoch();
+  dout(10) << __func__
+	   << " monmap next " << sub->next
+	   << " have " << epoch << dendl;
+  if (sub->next <= epoch) {
+    mon->send_latest_monmap(sub->session->con.get());
+    if (sub->onetime)
+      mon->session_map.remove_sub(sub);
+    else
+      sub->next = epoch + 1;
+  }
 }

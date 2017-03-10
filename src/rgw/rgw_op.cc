@@ -18,6 +18,7 @@
 #include "rgw_acl.h"
 #include "rgw_acl_s3.h"
 #include "rgw_policy_s3.h"
+#include "rgw_acl_swift.h"
 #include "rgw_user.h"
 #include "rgw_bucket.h"
 #include "rgw_log.h"
@@ -388,7 +389,13 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
     }
   }
 
-  s->bucket_acl = new RGWAccessControlPolicy(s->cct);
+  if(s->dialect.compare("s3") == 0) {
+    s->bucket_acl = new RGWAccessControlPolicy_S3(s->cct);
+  } else if(s->dialect.compare("swift")  == 0) {
+    s->bucket_acl = new RGWAccessControlPolicy_SWIFT(s->cct);
+  } else {
+    s->bucket_acl = new RGWAccessControlPolicy(s->cct);
+  }
 
   if (s->copy_source) { /* check if copy source is within the current domain */
     const char *src = s->copy_source;
@@ -754,6 +761,10 @@ int RGWGetObj::read_user_manifest_part(rgw_bucket& bucket, RGWObjEnt& ent, RGWAc
     return -EPERM;
   }
 
+  if (ent.size == 0) {
+    return 0;
+  }
+
   perfcounter->inc(l_rgw_get_b, cur_end - cur_ofs);
   while (cur_ofs <= cur_end) {
     bufferlist bl;
@@ -763,7 +774,12 @@ int RGWGetObj::read_user_manifest_part(rgw_bucket& bucket, RGWObjEnt& ent, RGWAc
 
     off_t len = bl.length();
     cur_ofs += len;
-    ofs += len;
+    if (!len) {
+        ldout(s->cct, 0) << "ERROR: read 0 bytes; ofs=" << cur_ofs
+	    << " end=" << cur_end << " from obj=" << ent.key.name
+	    << "[" << ent.key.instance << "]" << dendl;
+        return -EIO;
+    }
     ret = 0;
     perfcounter->tinc(l_rgw_get_lat,
                       (ceph_clock_now(s->cct) - start_time));
@@ -778,11 +794,12 @@ int RGWGetObj::read_user_manifest_part(rgw_bucket& bucket, RGWObjEnt& ent, RGWAc
 static int iterate_user_manifest_parts(CephContext *cct, RGWRados *store, off_t ofs, off_t end,
                                        rgw_bucket& bucket, string& obj_prefix, RGWAccessControlPolicy *bucket_policy,
                                        uint64_t *ptotal_len,
+                                       uint64_t *pobj_size,
                                        int (*cb)(rgw_bucket& bucket, RGWObjEnt& ent, RGWAccessControlPolicy *bucket_policy,
                                                  off_t start_ofs, off_t end_ofs, void *param), void *cb_param)
 {
   uint64_t obj_ofs = 0, len_count = 0;
-  bool found_start = false, found_end = false;
+  bool found_start = false, found_end = false, handled_end = false;
   string delim;
   bool is_truncated;
   vector<RGWObjEnt> objs;
@@ -803,7 +820,7 @@ static int iterate_user_manifest_parts(CephContext *cct, RGWRados *store, off_t 
 
     vector<RGWObjEnt>::iterator viter;
 
-    for (viter = objs.begin(); viter != objs.end() && !found_end; ++viter) {
+    for (viter = objs.begin(); viter != objs.end(); ++viter) {
       RGWObjEnt& ent = *viter;
       uint64_t cur_total_len = obj_ofs;
       uint64_t start_ofs = 0, end_ofs = ent.size;
@@ -823,7 +840,7 @@ static int iterate_user_manifest_parts(CephContext *cct, RGWRados *store, off_t 
       perfcounter->tinc(l_rgw_get_lat,
                        (ceph_clock_now(cct) - start_time));
 
-      if (found_start) {
+      if (found_start && !handled_end) {
         len_count += end_ofs - start_ofs;
 
         if (cb) {
@@ -833,12 +850,16 @@ static int iterate_user_manifest_parts(CephContext *cct, RGWRados *store, off_t 
         }
       }
 
+      handled_end = found_end;
       start_time = ceph_clock_now(cct);
     }
-  } while (is_truncated && !found_end);
+  } while (is_truncated);
 
   if (ptotal_len)
     *ptotal_len = len_count;
+  if (pobj_size) {
+    *pobj_size = obj_ofs;
+  }
 
   return 0;
 }
@@ -895,11 +916,9 @@ int RGWGetObj::handle_user_manifest(const char *prefix)
   }
 
   /* dry run to find out total length */
-  int r = iterate_user_manifest_parts(s->cct, store, ofs, end, bucket, obj_prefix, bucket_policy, &total_len, NULL, NULL);
+  int r = iterate_user_manifest_parts(s->cct, store, ofs, end, bucket, obj_prefix, bucket_policy, &total_len, &s->obj_size, NULL, NULL);
   if (r < 0)
     return r;
-
-  s->obj_size = total_len;
 
   if (!get_data) {
     bufferlist bl;
@@ -907,9 +926,14 @@ int RGWGetObj::handle_user_manifest(const char *prefix)
     return 0;
   }
 
-  r = iterate_user_manifest_parts(s->cct, store, ofs, end, bucket, obj_prefix, bucket_policy, NULL, get_obj_user_manifest_iterate_cb, (void *)this);
+  r = iterate_user_manifest_parts(s->cct, store, ofs, end, bucket, obj_prefix, bucket_policy, NULL, NULL, get_obj_user_manifest_iterate_cb, (void *)this);
   if (r < 0)
     return r;
+
+  if (!total_len) {
+    bufferlist bl;
+    send_response_data(bl, 0, 0);
+  }
 
   return 0;
 }

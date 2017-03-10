@@ -156,7 +156,10 @@ void PGPool::update(OSDMapRef map)
   info = *pi;
   auid = pi->auid;
   name = map->get_pool_name(id);
-  if (pi->get_snap_epoch() == map->get_epoch()) {
+  bool updated = false;
+  if ((map->get_epoch() != cached_epoch + 1) ||
+      (pi->get_snap_epoch() == map->get_epoch())) {
+    updated = true;
     pi->build_removed_snaps(newly_removed_snaps);
     interval_set<snapid_t> intersection;
     intersection.intersection_of(newly_removed_snaps, cached_removed_snaps);
@@ -172,16 +175,26 @@ void PGPool::update(OSDMapRef map)
     }
     snapc = pi->get_snap_context();
   } else {
+    /* 1) map->get_epoch() == cached_epoch + 1 &&
+     * 2) pi->get_snap_epoch() != map->get_epoch()
+     *
+     * From the if branch, 1 && 2 must be true.  From 2, we know that
+     * this map didn't change the set of removed snaps.  From 1, we
+     * know that our cached_removed_snaps matches the previous map.
+     * Thus, from 1 && 2, cached_removed snaps matches the current
+     * set of removed snaps and all we have to do is clear
+     * newly_removed_snaps.
+     */
     newly_removed_snaps.clear();
   }
+  cached_epoch = map->get_epoch();
   lgeneric_subdout(g_ceph_context, osd, 20)
     << "PGPool::update cached_removed_snaps "
     << cached_removed_snaps
     << " newly_removed_snaps "
     << newly_removed_snaps
     << " snapc " << snapc
-    << (pi->get_snap_epoch() == map->get_epoch() ?
-	" (updated)":" (no change)")
+    << (updated ? " (updated)":" (no change)")
     << dendl;
 }
 
@@ -1278,25 +1291,7 @@ bool PG::choose_acting(pg_shard_t &auth_log_shard_id)
     return false;
   }
 
-  if ((up.size() &&
-      !all_info.find(up_primary)->second.is_incomplete() &&
-      all_info.find(up_primary)->second.last_update >=
-       auth_log_shard->second.log_tail) &&
-      auth_log_shard->second.is_incomplete()) {
-    map<pg_shard_t, pg_info_t> complete_infos;
-    for (map<pg_shard_t, pg_info_t>::const_iterator i = all_info.begin();
-	 i != all_info.end();
-	 ++i) {
-      if (!i->second.is_incomplete())
-	complete_infos.insert(*i);
-    }
-    map<pg_shard_t, pg_info_t>::const_iterator i = find_best_info(
-      complete_infos);
-    if (i != complete_infos.end()) {
-      auth_log_shard = all_info.find(i->first);
-    }
-  }
-
+  assert(!auth_log_shard->second.is_incomplete());
   auth_log_shard_id = auth_log_shard->first;
 
   // Determine if compatibility needed
@@ -2414,11 +2409,11 @@ void PG::_update_calc_stats()
 
     // a misplaced object is not stored on the correct OSD
     uint64_t misplaced = 0;
-    unsigned i = 0;
     unsigned in_place = 0;
-    for (vector<int>::iterator p = up.begin(); p != up.end(); ++p, ++i) {
-      pg_shard_t s(*p,
-		   pool.info.ec_pool() ? shard_id_t(i) : shard_id_t::NO_SHARD);
+    for (set<pg_shard_t>::const_iterator p = upset.begin();
+	 p != upset.end();
+	 ++p) {
+      const pg_shard_t &s = *p;
       if (actingset.count(s)) {
 	++in_place;
       } else {

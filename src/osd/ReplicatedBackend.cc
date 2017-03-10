@@ -750,13 +750,16 @@ void ReplicatedBackend::be_deep_scrub(
   bufferlist bl, hdrbl;
   int r;
   __u64 pos = 0;
+
+  uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+
   while ( (r = store->read(
 	     coll,
 	     ghobject_t(
 	       poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
 	     pos,
 	     cct->_conf->osd_deep_scrub_stride, bl,
-	     true)) > 0) {
+	     fadvise_flags, true)) > 0) {
     handle.reset_tp_timeout();
     h << bl;
     pos += bl.length();
@@ -2030,7 +2033,9 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 	 iter->valid();
 	 iter->next()) {
       if (!out_op->omap_entries.empty() &&
-	  available <= (iter->key().size() + iter->value().length()))
+	  ((cct->_conf->osd_recovery_max_omap_entries_per_chunk > 0 &&
+	    out_op->omap_entries.size() >= cct->_conf->osd_recovery_max_omap_entries_per_chunk) ||
+	   available <= iter->key().size() + iter->value().length()))
 	break;
       out_op->omap_entries.insert(make_pair(iter->key(), iter->value()));
 

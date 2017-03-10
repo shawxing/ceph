@@ -274,12 +274,19 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
   }
 
   for (int o = 0; o < osdmap.get_max_osd(); o++) {
+    if (osdmap.is_out(o))
+      continue;
+    map<int,utime_t>::iterator found = down_pending_out.find(o);
     if (osdmap.is_down(o)) {
       // populate down -> out map
-      if (osdmap.is_in(o) &&
-	  down_pending_out.count(o) == 0) {
-	dout(10) << " adding osd." << o << " to down_pending_out map" << dendl;
-	down_pending_out[o] = ceph_clock_now(g_ceph_context);
+      if (found == down_pending_out.end()) {
+        dout(10) << " adding osd." << o << " to down_pending_out map" << dendl;
+        down_pending_out[o] = ceph_clock_now(g_ceph_context);
+      }
+    } else {
+      if (found != down_pending_out.end()) {
+        dout(10) << " removing osd." << o << " from down_pending_out map" << dendl;
+        down_pending_out.erase(found);
       }
     }
   }
@@ -1974,7 +1981,7 @@ bool OSDMonitor::prepare_alive(MOSDAlive *m)
 
   dout(7) << "prepare_alive want up_thru " << m->want << " have " << m->version
 	  << " from " << m->get_orig_source_inst() << dendl;
-  pending_inc.new_up_thru[from] = m->version;  // set to the latest map the OSD has
+  update_up_thru(from, m->version); // set to the latest map the OSD has
   wait_for_finished_proposal(new C_ReplyMap(this, m, m->version));
   return true;
 }
@@ -2076,6 +2083,19 @@ bool OSDMonitor::preprocess_pgtemp(MOSDPGTemp *m)
   return true;
 }
 
+void OSDMonitor::update_up_thru(int from, epoch_t up_thru)
+{
+  epoch_t old_up_thru = osdmap.get_up_thru(from);
+  map<int32_t,epoch_t>::iterator ut = pending_inc.new_up_thru.find(from);
+  if (ut != pending_inc.new_up_thru.end()) {
+    old_up_thru = ut->second;
+  }
+  if (up_thru > old_up_thru) {
+    // set up_thru too, so the osd doesn't have to ask again
+    pending_inc.new_up_thru[from] = up_thru;
+  }
+}
+
 bool OSDMonitor::prepare_pgtemp(MOSDPGTemp *m)
 {
   int from = m->get_orig_source().num();
@@ -2101,7 +2121,10 @@ bool OSDMonitor::prepare_pgtemp(MOSDPGTemp *m)
 	pending_inc.new_primary_temp.count(p->first))
       pending_inc.new_primary_temp[p->first] = -1;
   }
-  pending_inc.new_up_thru[from] = m->map_epoch;   // set up_thru too, so the osd doesn't have to ask again
+
+  // set up_thru too, so the osd doesn't have to ask again
+  update_up_thru(from, m->map_epoch);
+
   wait_for_finished_proposal(new C_ReplyMap(this, m, m->map_epoch));
   return true;
 }
@@ -2513,9 +2536,20 @@ void OSDMonitor::tick()
       dout(10) << "No full osds, removing full flag" << dendl;
       remove_flag(CEPH_OSDMAP_FULL);
     }
+
+    if (!mon->pgmon()->pg_map.nearfull_osds.empty()) {
+      dout(5) << "There are near full osds, setting nearfull flag" << dendl;
+      add_flag(CEPH_OSDMAP_NEARFULL);
+    } else if (osdmap.test_flag(CEPH_OSDMAP_NEARFULL)){
+      dout(10) << "No near full osds, removing nearfull flag" << dendl;
+      remove_flag(CEPH_OSDMAP_NEARFULL);
+    }
     if (pending_inc.new_flags != -1 &&
-	(pending_inc.new_flags ^ osdmap.flags) & CEPH_OSDMAP_FULL) {
-      dout(1) << "New setting for CEPH_OSDMAP_FULL -- doing propose" << dendl;
+       (pending_inc.new_flags ^ osdmap.flags) & (CEPH_OSDMAP_FULL | CEPH_OSDMAP_NEARFULL)) {
+      dout(1) << "New setting for" <<
+              (pending_inc.new_flags & CEPH_OSDMAP_FULL ? " CEPH_OSDMAP_FULL" : "") <<
+              (pending_inc.new_flags & CEPH_OSDMAP_NEARFULL ? " CEPH_OSDMAP_NEARFULL" : "")
+              << " -- doing propose" << dendl;
       do_propose = true;
     }
   }
@@ -2635,20 +2669,24 @@ void OSDMonitor::get_health(list<pair<health_status_t,string> >& summary,
     }
 
     // warn about flags
-    if (osdmap.test_flag(CEPH_OSDMAP_PAUSERD |
-			 CEPH_OSDMAP_PAUSEWR |
-			 CEPH_OSDMAP_NOUP |
-			 CEPH_OSDMAP_NODOWN |
-			 CEPH_OSDMAP_NOIN |
-			 CEPH_OSDMAP_NOOUT |
-			 CEPH_OSDMAP_NOBACKFILL |
-			 CEPH_OSDMAP_NOREBALANCE |
-			 CEPH_OSDMAP_NORECOVER |
-			 CEPH_OSDMAP_NOSCRUB |
-			 CEPH_OSDMAP_NODEEP_SCRUB |
-			 CEPH_OSDMAP_NOTIERAGENT)) {
+    uint64_t warn_flags =
+      CEPH_OSDMAP_PAUSERD |
+      CEPH_OSDMAP_PAUSEWR |
+      CEPH_OSDMAP_PAUSEREC |
+      CEPH_OSDMAP_NOUP |
+      CEPH_OSDMAP_NODOWN |
+      CEPH_OSDMAP_NOIN |
+      CEPH_OSDMAP_NOOUT |
+      CEPH_OSDMAP_NOBACKFILL |
+      CEPH_OSDMAP_NOREBALANCE |
+      CEPH_OSDMAP_NORECOVER |
+      CEPH_OSDMAP_NOSCRUB |
+      CEPH_OSDMAP_NODEEP_SCRUB |
+      CEPH_OSDMAP_NOTIERAGENT;
+    if (osdmap.test_flag(warn_flags)) {
       ostringstream ss;
-      ss << osdmap.get_flag_string() << " flag(s) set";
+      ss << osdmap.get_flag_string(osdmap.get_flags() & warn_flags)
+	 << " flag(s) set";
       summary.push_back(make_pair(HEALTH_WARN, ss.str()));
       if (detail)
 	detail->push_back(make_pair(HEALTH_WARN, ss.str()));

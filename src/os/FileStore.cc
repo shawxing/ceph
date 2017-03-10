@@ -2912,7 +2912,10 @@ int FileStore::fiemap(coll_t cid, const ghobject_t& oid,
     dout(10) << "read couldn't open " << cid << "/" << oid << ": " << cpp_strerror(r) << dendl;
   } else {
     uint64_t i;
+    struct fiemap_extent *extent = NULL;
+    struct fiemap_extent *last = NULL;
 
+more:
     r = backend->do_fiemap(**fd, offset, len, &fiemap);
     if (r < 0)
       goto done;
@@ -2922,7 +2925,7 @@ int FileStore::fiemap(coll_t cid, const ghobject_t& oid,
       goto done;
     }
 
-    struct fiemap_extent *extent = &fiemap->fm_extents[0];
+    extent = &fiemap->fm_extents[0];
 
     /* start where we were asked to start */
     if (extent->fe_logical < offset) {
@@ -2954,7 +2957,15 @@ int FileStore::fiemap(coll_t cid, const ghobject_t& oid,
       i++;
       extent++;
     }
+    const bool is_last = last->fe_flags & FIEMAP_EXTENT_LAST;
     free(fiemap);
+
+    if (!is_last) {
+      uint64_t xoffset = last->fe_logical + last->fe_length - offset;
+      offset = last->fe_logical + last->fe_length;
+      len -= xoffset;
+      goto more;
+    }
   }
 
 done:
@@ -3065,6 +3076,7 @@ int FileStore::_zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t 
 
 #ifdef CEPH_HAVE_FALLOCATE
 # if !defined(DARWIN) && !defined(__FreeBSD__)
+#    ifdef FALLOC_FL_KEEP_SIZE
   // first try to punch a hole.
   FDRef fd;
   ret = lfn_open(cid, oid, false, &fd);
@@ -3073,7 +3085,7 @@ int FileStore::_zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t 
   }
 
   // first try fallocate
-  ret = fallocate(**fd, FALLOC_FL_PUNCH_HOLE, offset, len);
+  ret = fallocate(**fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, offset, len);
   if (ret < 0)
     ret = -errno;
   lfn_close(fd);
@@ -3087,6 +3099,7 @@ int FileStore::_zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t 
     goto out;  // yay!
   if (ret != -EOPNOTSUPP)
     goto out;  // some other error
+#    endif
 # endif
 #endif
 
@@ -5402,6 +5415,21 @@ void FileStore::set_xattr_limits_via_conf()
   else
     m_filestore_max_inline_xattrs = fs_xattrs;
 }
+
+int FileStore::apply_layout_settings(const coll_t &cid)
+{
+  dout(20) << __func__ << " " << cid << dendl;
+  Index index;
+  int r = get_index(cid, &index);
+  if (r < 0) {
+    dout(10) << "Error getting index for " << cid << ": " << cpp_strerror(r)
+	     << dendl;
+    return r;
+  }
+
+  return index->apply_layout_settings();
+}
+
 
 // -- FSSuperblock --
 
