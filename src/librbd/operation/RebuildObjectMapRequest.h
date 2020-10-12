@@ -24,10 +24,10 @@ public:
   {
   }
 
-  virtual void send();
+  void send() override;
 
 protected:
-  virtual bool should_complete(int r);
+  bool should_complete(int r) override;
 
 private:
   /**
@@ -63,7 +63,7 @@ private:
 
   ImageCtxT &m_image_ctx;
   ProgressContext &m_prog_ctx;
-  State m_state;
+  State m_state = STATE_RESIZE_OBJECT_MAP;
   bool m_attempted_trim;
 
   void send_resize_object_map();

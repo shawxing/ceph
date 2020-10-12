@@ -25,9 +25,10 @@
 
 #include "common/errno.h"
 #include "common/linux_version.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 #include "include/compat.h"
 
+#define dout_context cct()
 #define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << "xfsfilestorebackend(" << get_basedir_path() << ") "
@@ -105,7 +106,7 @@ int XfsFileStoreBackend::detect_features()
     goto out_close;
   }
 
-  if (g_conf->filestore_xfs_extsize) {
+  if (cct()->_conf->filestore_xfs_extsize) {
     ret = set_extsize(fd, 1U << 15); // a few pages
     if (ret) {
       ret = 0;
@@ -143,6 +144,6 @@ int XfsFileStoreBackend::set_alloc_hint(int fd, uint64_t hint)
   if (!m_has_extsize)
     return -EOPNOTSUPP;
 
-  assert(hint < UINT_MAX);
+  ceph_assert(hint < UINT_MAX);
   return set_extsize(fd, hint);
 }

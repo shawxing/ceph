@@ -39,6 +39,7 @@
 #include "common/errno.h"
 #include "common/config.h"
 #include "common/sync_filesystem.h"
+#include "common/blkdev.h"
 
 #include "common/SloppyCRCMap.h"
 #include "os/filestore/chain_xattr.h"
@@ -46,6 +47,7 @@
 #define SLOPPY_CRC_XATTR "user.cephos.scrc"
 
 
+#define dout_context cct()
 #define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << "genericfilestorebackend(" << get_basedir_path() << ") "
@@ -54,21 +56,59 @@
 #define ALIGNED(x, by) (!((x) % (by)))
 #define ALIGN_UP(x, by) (ALIGNED((x), (by)) ? (x) : (ALIGN_DOWN((x), (by)) + (by)))
 
+using std::ostream;
+using std::ostringstream;
+using std::string;
+
+using ceph::bufferptr;
+using ceph::bufferlist;
+
 GenericFileStoreBackend::GenericFileStoreBackend(FileStore *fs):
   FileStoreBackend(fs),
   ioctl_fiemap(false),
   seek_data_hole(false),
-  m_filestore_fiemap(g_conf->filestore_fiemap),
-  m_filestore_seek_data_hole(g_conf->filestore_seek_data_hole),
-  m_filestore_fsync_flushes_journal_data(g_conf->filestore_fsync_flushes_journal_data),
-  m_filestore_splice(false) {}
+  use_splice(false),
+  m_filestore_fiemap(cct()->_conf->filestore_fiemap),
+  m_filestore_seek_data_hole(cct()->_conf->filestore_seek_data_hole),
+  m_filestore_fsync_flushes_journal_data(cct()->_conf->filestore_fsync_flushes_journal_data),
+  m_filestore_splice(cct()->_conf->filestore_splice)
+{
+  // rotational?
+  {
+    // NOTE: the below won't work on btrfs; we'll assume rotational.
+    string fn = get_basedir_path();
+    int fd = ::open(fn.c_str(), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+      return;
+    }
+    BlkDev blkdev(fd);
+    m_rotational = blkdev.is_rotational();
+    dout(20) << __func__ << " basedir " << fn
+	     << " rotational " << (int)m_rotational << dendl;
+    ::close(fd);
+  }
+  // journal rotational?
+  {
+    // NOTE: the below won't work on btrfs; we'll assume rotational.
+    string fn = get_journal_path();
+    int fd = ::open(fn.c_str(), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+      return;
+    }
+    BlkDev blkdev(fd);
+    m_journal_rotational = blkdev.is_rotational();
+    dout(20) << __func__ << " journal filename " << fn.c_str()
+	     << " journal rotational " << (int)m_journal_rotational << dendl;
+    ::close(fd);
+  }
+}
 
 int GenericFileStoreBackend::detect_features()
 {
   char fn[PATH_MAX];
   snprintf(fn, sizeof(fn), "%s/fiemap_test", get_basedir_path().c_str());
 
-  int fd = ::open(fn, O_CREAT|O_RDWR|O_TRUNC, 0644);
+  int fd = ::open(fn, O_CREAT|O_RDWR|O_TRUNC|O_CLOEXEC, 0644);
   if (fd < 0) {
     fd = -errno;
     derr << "detect_features: unable to create " << fn << ": " << cpp_strerror(fd) << dendl;
@@ -165,16 +205,20 @@ int GenericFileStoreBackend::detect_features()
   //splice detection
 #ifdef CEPH_HAVE_SPLICE
   if (!m_filestore_splice) {
+    dout(0) << __func__ << ": splice() is disabled via 'filestore splice' config option" << dendl;
+    use_splice = false;
+  } else {
     int pipefd[2];
     loff_t off_in = 0;
     int r;
-    if ((r = pipe(pipefd)) < 0)
-      dout(0) << "detect_features: splice  pipe met error " << cpp_strerror(errno) << dendl;
-    else {
+    if (pipe_cloexec(pipefd, 0) < 0) {
+      int e = errno;
+      dout(0) << "detect_features: splice pipe met error " << cpp_strerror(e) << dendl;
+    } else {
       lseek(fd, 0, SEEK_SET);
       r = splice(fd, &off_in, pipefd[1], NULL, 10, 0);
       if (!(r < 0 && errno == EINVAL)) {
-	m_filestore_splice = true;
+	use_splice = true;
 	dout(0) << "detect_features: splice is supported" << dendl;
       } else
 	dout(0) << "detect_features: splice is NOT supported" << dendl;
@@ -281,7 +325,7 @@ int GenericFileStoreBackend::do_fiemap(int fd, off_t start, size_t len, struct f
   fiemap->fm_length = len + start % CEPH_PAGE_SIZE;
   fiemap->fm_flags = FIEMAP_FLAG_SYNC; /* flush extents to disk if needed */
 
-#if defined(DARWIN) || defined(__FreeBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__)
   ret = -ENOTSUP;
   goto done_err;
 #else
@@ -305,7 +349,7 @@ int GenericFileStoreBackend::do_fiemap(int fd, off_t start, size_t len, struct f
   fiemap->fm_extent_count = fiemap->fm_mapped_extents;
   fiemap->fm_mapped_extents = 0;
 
-#if defined(DARWIN) || defined(__FreeBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__)
   ret = -ENOTSUP;
   goto done_err;
 #else
@@ -334,22 +378,22 @@ int GenericFileStoreBackend::_crc_load_or_init(int fd, SloppyCRCMap *cm)
     return 0;
   }
   if (l >= 0) {
-    bp = buffer::create(l);
+    bp = ceph::buffer::create(l);
     memcpy(bp.c_str(), buf, l);
   } else if (l == -ERANGE) {
     l = chain_fgetxattr(fd, SLOPPY_CRC_XATTR, 0, 0);
     if (l > 0) {
-      bp = buffer::create(l);
+      bp = ceph::buffer::create(l);
       l = chain_fgetxattr(fd, SLOPPY_CRC_XATTR, bp.c_str(), l);
     }
   }
   bufferlist bl;
   bl.append(std::move(bp));
-  bufferlist::iterator p = bl.begin();
+  auto p = bl.cbegin();
   try {
-    ::decode(*cm, p);
+    decode(*cm, p);
   }
-  catch (buffer::error &e) {
+  catch (ceph::buffer::error &e) {
     r = -EIO;
   }
   if (r < 0)
@@ -360,7 +404,7 @@ int GenericFileStoreBackend::_crc_load_or_init(int fd, SloppyCRCMap *cm)
 int GenericFileStoreBackend::_crc_save(int fd, SloppyCRCMap *cm)
 {
   bufferlist bl;
-  ::encode(*cm, bl);
+  encode(*cm, bl);
   int r = chain_fsetxattr(fd, SLOPPY_CRC_XATTR, bl.c_str(), bl.length());
   if (r < 0)
     derr << __func__ << " got " << cpp_strerror(r) << dendl;

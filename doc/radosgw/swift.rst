@@ -49,7 +49,7 @@ The following table describes the support status for current Swift functional fe
 +---------------------------------+-----------------+----------------------------------------+
 | **List Objects**                | Supported       |                                        |
 +---------------------------------+-----------------+----------------------------------------+
-| **Static Website**              | Not Supported   |                                        |
+| **Static Website**              | Supported       |                                        |
 +---------------------------------+-----------------+----------------------------------------+
 | **Create Object**               | Supported       |                                        |
 +---------------------------------+-----------------+----------------------------------------+
@@ -67,9 +67,11 @@ The following table describes the support status for current Swift functional fe
 +---------------------------------+-----------------+----------------------------------------+
 | **Expiring Objects**            | Supported       |                                        |
 +---------------------------------+-----------------+----------------------------------------+
-| **Object Versioning**           | Not Supported   |                                        |
+| **Temporary URLs**              | Partial Support | No support for container-level keys    |
++---------------------------------+-----------------+----------------------------------------+
+| **Object Versioning**           | Partial Support | No support for ``X-History-Location``  |
 +---------------------------------+-----------------+----------------------------------------+
 | **CORS**                        | Not Supported   |                                        |
 +---------------------------------+-----------------+----------------------------------------+
 
-.. _Swift API: http://developer.openstack.org/api-ref-objectstorage-v1.html
+.. _Swift API: https://developer.openstack.org/api-ref/object-store/index.html

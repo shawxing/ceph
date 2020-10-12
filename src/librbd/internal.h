@@ -13,45 +13,14 @@
 #include "include/buffer_fwd.h"
 #include "include/rbd/librbd.hpp"
 #include "include/rbd_types.h"
-#include "librbd/parent_types.h"
-
-enum {
-  l_librbd_first = 26000,
-
-  l_librbd_rd,               // read ops
-  l_librbd_rd_bytes,         // bytes read
-  l_librbd_rd_latency,       // average latency
-  l_librbd_wr,
-  l_librbd_wr_bytes,
-  l_librbd_wr_latency,
-  l_librbd_discard,
-  l_librbd_discard_bytes,
-  l_librbd_discard_latency,
-  l_librbd_flush,
-
-  l_librbd_aio_flush,
-  l_librbd_aio_flush_latency,
-
-  l_librbd_snap_create,
-  l_librbd_snap_remove,
-  l_librbd_snap_rollback,
-  l_librbd_snap_rename,
-
-  l_librbd_notify,
-  l_librbd_resize,
-
-  l_librbd_readahead,
-  l_librbd_readahead_bytes,
-
-  l_librbd_invalidate_cache,
-
-  l_librbd_last,
-};
+#include "cls/rbd/cls_rbd_types.h"
+#include "common/ceph_time.h"
+#include "librbd/Types.h"
 
 namespace librbd {
 
-  struct AioCompletion;
   struct ImageCtx;
+  namespace io { struct AioCompletion; }
 
   class NoOpProgressContext : public ProgressContext
   {
@@ -59,7 +28,7 @@ namespace librbd {
     NoOpProgressContext()
     {
     }
-    int update_progress(uint64_t offset, uint64_t src_size)
+    int update_progress(uint64_t offset, uint64_t src_size) override
     {
       return 0;
     }
@@ -74,6 +43,8 @@ namespace librbd {
   void image_options_create(rbd_image_options_t* opts);
   void image_options_create_ref(rbd_image_options_t* opts,
 				rbd_image_options_t orig);
+  void image_options_copy(rbd_image_options_t *opts,
+			  const ImageOptions &orig);
   void image_options_destroy(rbd_image_options_t opts);
   int image_options_set(rbd_image_options_t opts, int optname,
 			const std::string& optval);
@@ -88,55 +59,44 @@ namespace librbd {
   void image_options_clear(rbd_image_options_t opts);
   bool image_options_is_empty(rbd_image_options_t opts);
 
-  int snap_set(ImageCtx *ictx, const char *snap_name);
-
-  int list_images_v2(librados::IoCtx& io_ctx,
-      std::map<std::string, std::string>& images);
-  int list(librados::IoCtx& io_ctx, std::vector<std::string>& names);
-  int list_children(ImageCtx *ictx,
-		    std::set<std::pair<std::string, std::string> > & names);
   int create(librados::IoCtx& io_ctx, const char *imgname, uint64_t size,
 	     int *order);
   int create(librados::IoCtx& io_ctx, const char *imgname, uint64_t size,
 	     bool old_format, uint64_t features, int *order,
 	     uint64_t stripe_unit, uint64_t stripe_count);
-  int create(IoCtx& io_ctx, const char *imgname, uint64_t size,
-	     ImageOptions& opts);
-  int create_v2(IoCtx& io_ctx, const char *imgname, uint64_t bid, uint64_t size,
-		int order, uint64_t features, uint64_t stripe_unit,
-		uint64_t stripe_count, uint8_t journal_order,
-		uint8_t journal_splay_width,
-		const std::string &journal_pool,
-                const std::string &non_primary_global_image_id,
-                const std::string &primary_mirror_uuid);
+  int create(IoCtx& io_ctx, const std::string &image_name,
+	     const std::string &image_id, uint64_t size, ImageOptions& opts,
+             const std::string &non_primary_global_image_id,
+             const std::string &primary_mirror_uuid,
+             bool skip_mirror_enable);
   int clone(IoCtx& p_ioctx, const char *p_name, const char *p_snap_name,
 	    IoCtx& c_ioctx, const char *c_name,
 	    uint64_t features, int *c_order,
 	    uint64_t stripe_unit, int stripe_count);
-  int clone(IoCtx& p_ioctx, const char *p_name, const char *p_snap_name,
-	    IoCtx& c_ioctx, const char *c_name, ImageOptions& c_opts);
+  int clone(IoCtx& p_ioctx, const char *p_id, const char *p_name,
+            const char *p_snap_name, IoCtx& c_ioctx, const char *c_id,
+            const char *c_name, ImageOptions& c_opts,
+            const std::string &non_primary_global_image_id,
+            const std::string &primary_mirror_uuid);
   int rename(librados::IoCtx& io_ctx, const char *srcname, const char *dstname);
   int info(ImageCtx *ictx, image_info_t& info, size_t image_size);
   int get_old_format(ImageCtx *ictx, uint8_t *old);
   int get_size(ImageCtx *ictx, uint64_t *size);
   int get_features(ImageCtx *ictx, uint64_t *features);
-  int update_features(ImageCtx *ictx, uint64_t features, bool enabled);
   int get_overlap(ImageCtx *ictx, uint64_t *overlap);
-  int get_parent_info(ImageCtx *ictx, std::string *parent_pool_name,
-		      std::string *parent_name, std::string *parent_snap_name);
   int get_flags(ImageCtx *ictx, uint64_t *flags);
   int set_image_notification(ImageCtx *ictx, int fd, int type);
   int is_exclusive_lock_owner(ImageCtx *ictx, bool *is_owner);
+  int lock_acquire(ImageCtx *ictx, rbd_lock_mode_t lock_mode);
+  int lock_release(ImageCtx *ictx);
+  int lock_get_owners(ImageCtx *ictx, rbd_lock_mode_t *lock_mode,
+                      std::list<std::string> *lock_owners);
+  int lock_break(ImageCtx *ictx, rbd_lock_mode_t lock_mode,
+                 const std::string &lock_owner);
 
-  int remove(librados::IoCtx& io_ctx, const char *imgname,
-	     ProgressContext& prog_ctx, bool force=false);
-  int snap_list(ImageCtx *ictx, std::vector<snap_info_t>& snaps);
-  int snap_exists(ImageCtx *ictx, const char *snap_name, bool *exists);
-  int snap_is_protected(ImageCtx *ictx, const char *snap_name,
-			bool *is_protected);
   int copy(ImageCtx *ictx, IoCtx& dest_md_ctx, const char *destname,
-	   ImageOptions& opts, ProgressContext &prog_ctx);
-  int copy(ImageCtx *src, ImageCtx *dest, ProgressContext &prog_ctx);
+	   ImageOptions& opts, ProgressContext &prog_ctx, size_t sparse_size);
+  int copy(ImageCtx *src, ImageCtx *dest, ProgressContext &prog_ctx, size_t sparse_size);
 
   /* cooperative locking */
   int list_lockers(ImageCtx *ictx,
@@ -169,46 +129,15 @@ namespace librbd {
   int64_t read_iterate(ImageCtx *ictx, uint64_t off, uint64_t len,
 		       int (*cb)(uint64_t, size_t, const char *, void *),
 		       void *arg);
-  int diff_iterate(ImageCtx *ictx, const char *fromsnapname, uint64_t off,
-                   uint64_t len, bool include_parent, bool whole_object,
-		   int (*cb)(uint64_t, size_t, int, void *),
-		   void *arg);
-  void readahead(ImageCtx *ictx,
-                 const vector<pair<uint64_t,uint64_t> >& image_extents);
 
-  int flush(ImageCtx *ictx);
   int invalidate_cache(ImageCtx *ictx);
-  int poll_io_events(ImageCtx *ictx, AioCompletion **comps, int numcomp);
+  int poll_io_events(ImageCtx *ictx, io::AioCompletion **comps, int numcomp);
   int metadata_list(ImageCtx *ictx, const string &last, uint64_t max, map<string, bufferlist> *pairs);
   int metadata_get(ImageCtx *ictx, const std::string &key, std::string *value);
-  int metadata_set(ImageCtx *ictx, const std::string &key, const std::string &value);
-  int metadata_remove(ImageCtx *ictx, const std::string &key);
 
-  int mirror_mode_get(IoCtx& io_ctx, rbd_mirror_mode_t *mirror_mode);
-  int mirror_mode_set(IoCtx& io_ctx, rbd_mirror_mode_t mirror_mode);
-  int mirror_peer_add(IoCtx& io_ctx, std::string *uuid,
-                      const std::string &cluster_name,
-                      const std::string &client_name);
-  int mirror_peer_remove(IoCtx& io_ctx, const std::string &uuid);
-  int mirror_peer_list(IoCtx& io_ctx, std::vector<mirror_peer_t> *peers);
-  int mirror_peer_set_client(IoCtx& io_ctx, const std::string &uuid,
-                             const std::string &client_name);
-  int mirror_peer_set_cluster(IoCtx& io_ctx, const std::string &uuid,
-                              const std::string &cluster_name);
-  int mirror_image_status_list(IoCtx& io_ctx, const std::string &start_id,
-      size_t max, std::map<std::string, mirror_image_status_t> *images);
-  int mirror_image_status_summary(IoCtx& io_ctx,
-      std::map<mirror_image_status_state_t, int> *states);
-
-  int mirror_image_enable(ImageCtx *ictx);
-  int mirror_image_disable(ImageCtx *ictx, bool force);
-  int mirror_image_promote(ImageCtx *ictx, bool force);
-  int mirror_image_demote(ImageCtx *ictx);
-  int mirror_image_resync(ImageCtx *ictx);
-  int mirror_image_get_info(ImageCtx *ictx, mirror_image_info_t *mirror_image_info,
-                            size_t info_size);
-  int mirror_image_get_status(ImageCtx *ictx, mirror_image_status_t *status,
-			      size_t status_size);
+  int list_watchers(ImageCtx *ictx, std::list<librbd::image_watcher_t> &watchers);
 }
+
+std::ostream &operator<<(std::ostream &os, const librbd::ImageOptions &opts);
 
 #endif

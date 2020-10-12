@@ -19,6 +19,7 @@
 #include "Journal.h"
 #include "FileJournal.h"
 #include "common/RWLock.h"
+#include "osd/OpRequest.h"
 
 class JournalingObjectStore : public ObjectStore {
 protected:
@@ -27,18 +28,19 @@ protected:
 
 
   class SubmitManager {
-    Mutex lock;
+    CephContext* cct;
+    ceph::mutex lock = ceph::make_mutex("JOS::SubmitManager::lock");
     uint64_t op_seq;
     uint64_t op_submitted;
   public:
-    SubmitManager() :
-      lock("JOS::SubmitManager::lock", false, true, false, g_ceph_context),
+    SubmitManager(CephContext* cct) :
+      cct(cct),
       op_seq(0), op_submitted(0)
     {}
     uint64_t op_submit_start();
     void op_submit_finish(uint64_t op);
     void set_op_seq(uint64_t seq) {
-      Mutex::Locker l(lock);
+      std::lock_guard l{lock};
       op_submitted = op_seq = seq;
     }
     uint64_t get_op_seq() {
@@ -47,31 +49,30 @@ protected:
   } submit_manager;
 
   class ApplyManager {
+    CephContext* cct;
     Journal *&journal;
     Finisher &finisher;
 
-    Mutex apply_lock;
+    ceph::mutex apply_lock = ceph::make_mutex("JOS::ApplyManager::apply_lock");
     bool blocked;
-    Cond blocked_cond;
+    ceph::condition_variable blocked_cond;
     int open_ops;
     uint64_t max_applied_seq;
 
-    Mutex com_lock;
-    map<version_t, vector<Context*> > commit_waiters;
+    ceph::mutex com_lock = ceph::make_mutex("JOS::ApplyManager::com_lock");
+    std::map<version_t, std::vector<Context*> > commit_waiters;
     uint64_t committing_seq, committed_seq;
 
   public:
-    ApplyManager(Journal *&j, Finisher &f) :
-      journal(j), finisher(f),
-      apply_lock("JOS::ApplyManager::apply_lock", false, true, false, g_ceph_context),
+    ApplyManager(CephContext* cct, Journal *&j, Finisher &f) :
+      cct(cct), journal(j), finisher(f),
       blocked(false),
       open_ops(0),
       max_applied_seq(0),
-      com_lock("JOS::ApplyManager::com_lock", false, true, false, g_ceph_context),
       committing_seq(0), committed_seq(0) {}
     void reset() {
-      assert(open_ops == 0);
-      assert(blocked == false);
+      ceph_assert(open_ops == 0);
+      ceph_assert(blocked == false);
       max_applied_seq = 0;
       committing_seq = 0;
       committed_seq = 0;
@@ -83,25 +84,25 @@ protected:
     void commit_started();
     void commit_finish();
     bool is_committing() {
-      Mutex::Locker l(com_lock);
+      std::lock_guard l{com_lock};
       return committing_seq != committed_seq;
     }
     uint64_t get_committed_seq() {
-      Mutex::Locker l(com_lock);
+      std::lock_guard l{com_lock};
       return committed_seq;
     }
     uint64_t get_committing_seq() {
-      Mutex::Locker l(com_lock);
+      std::lock_guard l{com_lock};
       return committing_seq;
     }
     void init_seq(uint64_t fs_op_seq) {
       {
-	Mutex::Locker l(com_lock);
+	std::lock_guard l{com_lock};
 	committed_seq = fs_op_seq;
 	committing_seq = fs_op_seq;
       }
       {
-	Mutex::Locker l(apply_lock);
+	std::lock_guard l{apply_lock};
 	max_applied_seq = fs_op_seq;
       }
     }
@@ -115,10 +116,10 @@ protected:
   void journal_write_close();
   int journal_replay(uint64_t fs_op_seq);
 
-  void _op_journal_transactions(bufferlist& tls, uint32_t orig_len, uint64_t op,
+  void _op_journal_transactions(ceph::buffer::list& tls, uint32_t orig_len, uint64_t op,
 				Context *onjournal, TrackedOpRef osd_op);
 
-  virtual int do_transactions(vector<ObjectStore::Transaction>& tls, uint64_t op_seq) = 0;
+  virtual int do_transactions(std::vector<ObjectStore::Transaction>& tls, uint64_t op_seq) = 0;
 
 public:
   bool is_committing() {
@@ -129,14 +130,15 @@ public:
   }
 
 public:
-  explicit JournalingObjectStore(const std::string& path)
-    : ObjectStore(path),
+  JournalingObjectStore(CephContext* cct, const std::string& path)
+    : ObjectStore(cct, path),
       journal(NULL),
-      finisher(g_ceph_context, "JournalObjectStore", "fn_jrn_objstore"),
-      apply_manager(journal, finisher),
+      finisher(cct, "JournalObjectStore", "fn_jrn_objstore"),
+      submit_manager(cct),
+      apply_manager(cct, journal, finisher),
       replaying(false) {}
 
-  ~JournalingObjectStore() {
+  ~JournalingObjectStore() override {
   }
 };
 

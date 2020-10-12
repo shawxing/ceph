@@ -26,7 +26,7 @@
 #include "include/linux_fiemap.h"
 #include "include/color.h"
 #include "include/buffer.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #ifndef __CYGWIN__
 #include "os/fs/btrfs_ioctl.h"
@@ -43,9 +43,14 @@
 
 #if defined(__linux__)
 
+#define dout_context cct()
 #define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << "btrfsfilestorebackend(" << get_basedir_path() << ") "
+
+using std::cerr;
+using std::list;
+using std::string;
 
 #define ALIGN_DOWN(x, by) ((x) - ((x) % (by)))
 #define ALIGNED(x, by) (!((x) % (by)))
@@ -55,8 +60,8 @@ BtrfsFileStoreBackend::BtrfsFileStoreBackend(FileStore *fs):
     GenericFileStoreBackend(fs), has_clone_range(false),
     has_snap_create(false), has_snap_destroy(false),
     has_snap_create_v2(false), has_wait_sync(false), stable_commits(false),
-    m_filestore_btrfs_clone_range(g_conf->filestore_btrfs_clone_range),
-    m_filestore_btrfs_snap (g_conf->filestore_btrfs_snap) { }
+    m_filestore_btrfs_clone_range(cct()->_conf->filestore_btrfs_clone_range),
+    m_filestore_btrfs_snap (cct()->_conf->filestore_btrfs_snap) { }
 
 int BtrfsFileStoreBackend::detect_features()
 {
@@ -68,7 +73,7 @@ int BtrfsFileStoreBackend::detect_features()
 
   // clone_range?
   if (m_filestore_btrfs_clone_range) {
-    int fd = ::openat(get_basedir_fd(), "clone_range_test", O_CREAT|O_WRONLY, 0600);
+    int fd = ::openat(get_basedir_fd(), "clone_range_test", O_CREAT|O_WRONLY|O_CLOEXEC, 0600);
     if (fd >= 0) {
       if (::unlinkat(get_basedir_fd(), "clone_range_test", 0) < 0) {
 	r = -errno;
@@ -107,7 +112,7 @@ int BtrfsFileStoreBackend::detect_features()
     r = -errno;
     dout(0) << "detect_feature: failed to create simple subvolume " << vol_args.name << ": " << cpp_strerror(r) << dendl;
   }
-  int srcfd = ::openat(get_basedir_fd(), vol_args.name, O_RDONLY);
+  int srcfd = ::openat(get_basedir_fd(), vol_args.name, O_RDONLY|O_CLOEXEC);
   if (srcfd < 0) {
     r = -errno;
     dout(0) << "detect_feature: failed to open " << vol_args.name << ": " << cpp_strerror(r) << dendl;
@@ -320,12 +325,8 @@ int BtrfsFileStoreBackend::list_checkpoints(list<string>& ls)
 
   list<string> snaps;
   char path[PATH_MAX];
-  char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
   struct dirent *de;
-  while (::readdir_r(dir, (struct dirent *)&buf, &de) == 0) {
-    if (!de)
-      break;
-
+  while ((de = ::readdir(dir))) {
     snprintf(path, sizeof(path), "%s/%s", get_basedir_path().c_str(), de->d_name);
 
     struct stat st;
@@ -448,7 +449,7 @@ int BtrfsFileStoreBackend::rollback_to(const string& name)
   snprintf(s, sizeof(s), "%s/%s", get_basedir_path().c_str(), name.c_str());
 
   // roll back
-  vol_args.fd = ::open(s, O_RDONLY);
+  vol_args.fd = ::open(s, O_RDONLY|O_CLOEXEC);
   if (vol_args.fd < 0) {
     ret = -errno;
     dout(0) << "rollback_to: error opening '" << s << "': " << cpp_strerror(ret) << dendl;
@@ -469,7 +470,8 @@ int BtrfsFileStoreBackend::destroy_checkpoint(const string& name)
   btrfs_ioctl_vol_args vol_args;
   memset(&vol_args, 0, sizeof(vol_args));
   vol_args.fd = 0;
-  strncpy(vol_args.name, name.c_str(), sizeof(vol_args.name));
+  strncpy(vol_args.name, name.c_str(), sizeof(vol_args.name) - 1);
+  vol_args.name[sizeof(vol_args.name) - 1] = '\0';
 
   int ret = ::ioctl(get_basedir_fd(), BTRFS_IOC_SNAP_DESTROY, &vol_args);
   if (ret) {

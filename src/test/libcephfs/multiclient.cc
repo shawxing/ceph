@@ -15,12 +15,14 @@
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
 #include <errno.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#ifdef __linux__
 #include <sys/xattr.h>
+#endif
 
 TEST(LibCephFS, MulticlientSimple) {
   struct ceph_mount_info *ca, *cb;

@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #ifndef RGW_PERIOD_HISTORY_H
 #define RGW_PERIOD_HISTORY_H
@@ -8,7 +8,7 @@
 #include <mutex>
 #include <system_error>
 #include <boost/intrusive/avl_set.hpp>
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 #include "include/types.h"
 
 namespace bi = boost::intrusive;
@@ -74,6 +74,9 @@ class RGWPeriodHistory final {
 
     void prev() { epoch--; }
     void next() { epoch++; }
+
+    friend bool operator==(const Cursor& lhs, const Cursor& rhs);
+    friend bool operator!=(const Cursor& lhs, const Cursor& rhs);
 
    private:
     // private constructors for RGWPeriodHistory

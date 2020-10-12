@@ -1,4 +1,5 @@
-#!/bin/bash -ex
+#!/usr/bin/env bash
+set -ex
 
 parallel=1
 [ "$1" = "--serial" ] && parallel=0
@@ -11,24 +12,34 @@ function cleanup() {
 }
 trap cleanup EXIT ERR HUP INT QUIT
 
-pids=""
+declare -A pids
+
 for f in \
-    api_aio api_io api_list api_lock api_misc \
-    api_tier api_pool api_snapshots api_stat api_watch_notify api_cmd \
+    api_aio api_aio_pp \
+    api_io api_io_pp \
+    api_asio api_list \
+    api_lock api_lock_pp \
+    api_misc api_misc_pp \
+    api_tier_pp \
+    api_pool \
+    api_snapshots api_snapshots_pp \
+    api_stat api_stat_pp \
+    api_watch_notify api_watch_notify_pp \
+    api_cmd api_cmd_pp \
+    api_service api_service_pp \
     api_c_write_operations \
     api_c_read_operations \
-    api_tmap_migrate \
     list_parallel \
     open_pools_parallel \
-    delete_pools_parallel \
-    watch_notify
+    delete_pools_parallel
 do
     if [ $parallel -eq 1 ]; then
 	r=`printf '%25s' $f`
-	bash -o pipefail -exc "ceph_test_rados_$f $color 2>&1 | tee ceph_test_rados_$f.log | sed \"s/^/$r: /\"" &
+	ff=`echo $f | awk '{print $1}'`
+	bash -o pipefail -exc "ceph_test_rados_$f $color 2>&1 | tee ceph_test_rados_$ff.log | sed \"s/^/$r: /\"" &
 	pid=$!
 	echo "test $f on pid $pid"
-	pids="$pids $pid"
+	pids[$f]=$pid
     else
 	ceph_test_rados_$f
     fi
@@ -36,11 +47,12 @@ done
 
 ret=0
 if [ $parallel -eq 1 ]; then
-for p in $pids
+for t in "${!pids[@]}"
 do
-  if ! wait $p
+  pid=${pids[$t]}
+  if ! wait $pid
   then
-    echo "error in $p"
+    echo "error in $t ($pid)"
     ret=1
   fi
 done

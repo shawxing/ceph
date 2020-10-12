@@ -50,8 +50,8 @@ struct Dependency {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(bufferlist::iterator &it);
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(bufferlist::const_iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 
   static void generate_test_instances(std::list<Dependency *> &o);
@@ -72,6 +72,8 @@ enum ActionType {
   ACTION_TYPE_CLOSE_IMAGE     = 7,
   ACTION_TYPE_AIO_OPEN_IMAGE  = 8,
   ACTION_TYPE_AIO_CLOSE_IMAGE = 9,
+  ACTION_TYPE_DISCARD         = 10,
+  ACTION_TYPE_AIO_DISCARD     = 11
 };
 
 struct ActionBase {
@@ -87,7 +89,7 @@ struct ActionBase {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -124,7 +126,7 @@ struct ImageActionBase : public ActionBase {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -142,7 +144,7 @@ struct IoActionBase : public ImageActionBase {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -166,6 +168,18 @@ struct WriteAction : public IoActionBase {
   WriteAction(action_id_t id, thread_id_t thread_id,
               const Dependencies &dependencies, imagectx_id_t imagectx_id,
               uint64_t offset, uint64_t length)
+    : IoActionBase(id, thread_id, dependencies, imagectx_id, offset, length) {
+  }
+};
+
+struct DiscardAction : public IoActionBase {
+  static const ActionType ACTION_TYPE = ACTION_TYPE_DISCARD;
+
+  DiscardAction() {
+  }
+  DiscardAction(action_id_t id, thread_id_t thread_id,
+                const Dependencies &dependencies, imagectx_id_t imagectx_id,
+                uint64_t offset, uint64_t length)
     : IoActionBase(id, thread_id, dependencies, imagectx_id, offset, length) {
   }
 };
@@ -194,6 +208,18 @@ struct AioWriteAction : public IoActionBase {
   }
 };
 
+struct AioDiscardAction : public IoActionBase {
+  static const ActionType ACTION_TYPE = ACTION_TYPE_AIO_DISCARD;
+
+  AioDiscardAction() {
+  }
+  AioDiscardAction(action_id_t id, thread_id_t thread_id,
+                   const Dependencies &dependencies, imagectx_id_t imagectx_id,
+                   uint64_t offset, uint64_t length)
+    : IoActionBase(id, thread_id, dependencies, imagectx_id, offset, length) {
+  }
+};
+
 struct OpenImageAction : public ImageActionBase {
   static const ActionType ACTION_TYPE = ACTION_TYPE_OPEN_IMAGE;
 
@@ -212,7 +238,7 @@ struct OpenImageAction : public ImageActionBase {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -245,7 +271,7 @@ struct AioOpenImageAction : public ImageActionBase {
   }
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -264,7 +290,7 @@ struct UnknownAction {
   static const ActionType ACTION_TYPE = static_cast<ActionType>(-1);
 
   void encode(bufferlist &bl) const;
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode(__u8 version, bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 };
 
@@ -272,8 +298,10 @@ typedef boost::variant<StartThreadAction,
                        StopThreadAction,
                        ReadAction,
                        WriteAction,
+                       DiscardAction,
                        AioReadAction,
                        AioWriteAction,
+                       AioDiscardAction,
                        OpenImageAction,
                        CloseImageAction,
                        AioOpenImageAction,
@@ -290,25 +318,22 @@ public:
   }
 
   void encode(bufferlist &bl) const;
-  void decode(bufferlist::iterator &it);
-  void decode_unversioned(bufferlist::iterator &it);
+  void decode(bufferlist::const_iterator &it);
+  void decode_unversioned(bufferlist::const_iterator &it);
   void dump(Formatter *f) const;
 
   static void generate_test_instances(std::list<ActionEntry *> &o);
 
 private:
-  void decode(__u8 version, bufferlist::iterator &it);
+  void decode_versioned(__u8 version, bufferlist::const_iterator &it);
 };
 
 WRITE_CLASS_ENCODER(ActionEntry);
 
-} // namespace action
-} // namespace rbd_replay
-
 std::ostream &operator<<(std::ostream &out,
                          const rbd_replay::action::ActionType &type);
 
-using rbd_replay::action::decode;
-using rbd_replay::action::encode;
+} // namespace action
+} // namespace rbd_replay
 
 #endif // CEPH_RBD_REPLAY_ACTION_TYPES_H

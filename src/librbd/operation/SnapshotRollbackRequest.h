@@ -7,13 +7,13 @@
 #include "librbd/operation/Request.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/internal.h"
+#include "librbd/journal/Types.h"
 #include <string>
 
 class Context;
 
 namespace librbd {
 
-class ImageCtx;
 class ProgressContext;
 
 namespace operation {
@@ -34,6 +34,9 @@ public:
    *                  v
    *            STATE_RESIZE_IMAGE (skip if resize not
    *                  |             required)
+   *                  v
+   *            STATE_GET_SNAP_OBJECT_MAP (skip if object)
+   *                  |                    map disabled)
    *                  v
    *            STATE_ROLLBACK_OBJECT_MAP (skip if object
    *                  |                    map disabled)
@@ -57,36 +60,44 @@ public:
    */
 
   SnapshotRollbackRequest(ImageCtxT &image_ctx, Context *on_finish,
-                          const std::string &snap_name, uint64_t snap_id,
+			  const cls::rbd::SnapshotNamespace &snap_namespace,
+                          const std::string &snap_name,
+			  uint64_t snap_id,
                           uint64_t snap_size, ProgressContext &prog_ctx);
-  virtual ~SnapshotRollbackRequest();
+  ~SnapshotRollbackRequest() override;
 
 protected:
-  virtual void send_op();
-  virtual bool should_complete(int r) {
+  void send_op() override;
+  bool should_complete(int r) override {
     return true;
   }
 
-  virtual journal::Event create_event(uint64_t op_tid) const {
-    return journal::SnapRollbackEvent(op_tid, m_snap_name);
+  journal::Event create_event(uint64_t op_tid) const override {
+    return journal::SnapRollbackEvent(op_tid, m_snap_namespace, m_snap_name);
   }
 
 private:
+  cls::rbd::SnapshotNamespace m_snap_namespace;
   std::string m_snap_name;
   uint64_t m_snap_id;
   uint64_t m_snap_size;
+  uint64_t m_head_num_objects;
   ProgressContext &m_prog_ctx;
 
   NoOpProgressContext m_no_op_prog_ctx;
 
   bool m_blocking_writes = false;
   decltype(ImageCtxT::object_map) m_object_map;
+  decltype(ImageCtxT::object_map) m_snap_object_map;
 
   void send_block_writes();
   Context *handle_block_writes(int *result);
 
   void send_resize_image();
   Context *handle_resize_image(int *result);
+
+  void send_get_snap_object_map();
+  Context *handle_get_snap_object_map(int *result);
 
   void send_rollback_object_map();
   Context *handle_rollback_object_map(int *result);

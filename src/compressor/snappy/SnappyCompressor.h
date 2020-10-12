@@ -17,64 +17,99 @@
 
 #include <snappy.h>
 #include <snappy-sinksource.h>
-#include "include/buffer.h"
+#include "common/config.h"
 #include "compressor/Compressor.h"
+#include "include/buffer.h"
 
-class BufferlistSource : public snappy::Source {
-  list<bufferptr>::const_iterator pb;
-  size_t pb_off;
-  size_t left;
+class CEPH_BUFFER_API BufferlistSource : public snappy::Source {
+  ceph::bufferlist::const_iterator pb;
+  size_t remaining;
 
  public:
-  explicit BufferlistSource(const bufferlist &data): pb(data.buffers().begin()), pb_off(0), left(data.length()) {}
-  virtual ~BufferlistSource() {}
-  virtual size_t Available() const { return left; }
-  virtual const char* Peek(size_t* len) {
-    if (left) {
-      *len = pb->length() - pb_off;
-      return pb->c_str() + pb_off;
-    } else {
-      *len = 0;
-      return NULL;
-    }
+  explicit BufferlistSource(ceph::bufferlist::const_iterator _pb, size_t _input_len)
+    : pb(_pb),
+      remaining(_input_len) {
+    remaining = std::min(remaining, (size_t)pb.get_remaining());
   }
-  virtual void Skip(size_t n) {
-    if (n + pb_off == pb->length()) {
-      ++pb;
-      pb_off = 0;
-    } else {
-      pb_off += n;
+  size_t Available() const override {
+    return remaining;
+  }
+  const char *Peek(size_t *len) override {
+    const char *data = NULL;
+    *len = 0;
+    size_t avail = Available();
+    if (avail) {
+      auto ptmp = pb;
+      *len = ptmp.get_ptr_and_advance(avail, &data);
     }
-    left -= n;
+    return data;
+  }
+  void Skip(size_t n) override {
+    ceph_assert(n <= remaining);
+    pb += n;
+    remaining -= n;
+  }
+
+  ceph::bufferlist::const_iterator get_pos() const {
+    return pb;
   }
 };
 
 class SnappyCompressor : public Compressor {
  public:
-  virtual ~SnappyCompressor() {}
-  virtual const char* get_method_name() { return "snappy"; }
-  virtual int compress(const bufferlist &src, bufferlist &dst) {
-    BufferlistSource source(src);
-    bufferptr ptr(snappy::MaxCompressedLength(src.length()));
+  SnappyCompressor(CephContext* cct) : Compressor(COMP_ALG_SNAPPY, "snappy") {
+#ifdef HAVE_QATZIP
+    if (cct->_conf->qat_compressor_enabled && qat_accel.init("snappy"))
+      qat_enabled = true;
+    else
+      qat_enabled = false;
+#endif
+  }
+
+  int compress(const ceph::bufferlist &src, ceph::bufferlist &dst, boost::optional<int32_t> &compressor_message) override {
+#ifdef HAVE_QATZIP
+    if (qat_enabled)
+      return qat_accel.compress(src, dst, compressor_message);
+#endif
+    BufferlistSource source(const_cast<ceph::bufferlist&>(src).begin(), src.length());
+    ceph::bufferptr ptr = ceph::buffer::create_small_page_aligned(
+      snappy::MaxCompressedLength(src.length()));
     snappy::UncheckedByteArraySink sink(ptr.c_str());
     snappy::Compress(&source, &sink);
-    dst.append(ptr, 0, sink.CurrentDestination()-ptr.c_str());
+    dst.append(ptr, 0, sink.CurrentDestination() - ptr.c_str());
     return 0;
   }
-  virtual int decompress(const bufferlist &src, bufferlist &dst) {
-    size_t res_len = 0;
-    // Trick, decompress only need first 32bits buffer
-    bufferlist tmp;
-    tmp.substr_of( src, 0, 4 );
-    if (!snappy::GetUncompressedLength(tmp.c_str(), tmp.length(), &res_len))
+
+  int decompress(const ceph::bufferlist &src, ceph::bufferlist &dst, boost::optional<int32_t> compressor_message) override {
+#ifdef HAVE_QATZIP
+    if (qat_enabled)
+      return qat_accel.decompress(src, dst, compressor_message);
+#endif
+    auto i = src.begin();
+    return decompress(i, src.length(), dst, compressor_message);
+  }
+
+  int decompress(ceph::bufferlist::const_iterator &p,
+		 size_t compressed_len,
+		 ceph::bufferlist &dst,
+		 boost::optional<int32_t> compressor_message) override {
+#ifdef HAVE_QATZIP
+    if (qat_enabled)
+      return qat_accel.decompress(p, compressed_len, dst, compressor_message);
+#endif
+    snappy::uint32 res_len = 0;
+    BufferlistSource source_1(p, compressed_len);
+    if (!snappy::GetUncompressedLength(&source_1, &res_len)) {
       return -1;
-    BufferlistSource source(src);
-    bufferptr ptr(res_len);
-    if (snappy::RawUncompress(&source, ptr.c_str())) {
+    }
+    BufferlistSource source_2(p, compressed_len);
+    ceph::bufferptr ptr(res_len);
+    if (snappy::RawUncompress(&source_2, ptr.c_str())) {
+      p = source_2.get_pos();
       dst.append(ptr);
       return 0;
     }
-    return -1;
+    return -2;
   }
 };
 

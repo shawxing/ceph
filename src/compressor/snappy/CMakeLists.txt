@@ -5,7 +5,10 @@ set(snappy_sources
 )
 
 add_library(ceph_snappy SHARED ${snappy_sources})
-add_dependencies(ceph_snappy ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
-target_link_libraries(ceph_snappy snappy)
-set_target_properties(ceph_snappy PROPERTIES VERSION 2.0.0 SOVERSION 2)
-install(TARGETS ceph_snappy DESTINATION lib/compressor)
+target_link_libraries(ceph_snappy
+  PRIVATE snappy::snappy compressor $<$<PLATFORM_ID:Windows>:ceph-common>)
+set_target_properties(ceph_snappy PROPERTIES
+  VERSION 2.0.0
+  SOVERSION 2
+  INSTALL_RPATH "")
+install(TARGETS ceph_snappy DESTINATION ${compressor_plugin_dir})

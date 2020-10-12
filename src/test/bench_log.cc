@@ -9,6 +9,8 @@
 #include "common/ceph_argparse.h"
 #include "global/global_init.h"
 
+#define dout_context g_ceph_context
+
 struct T : public Thread {
   int num;
   set<int> myset;
@@ -20,7 +22,7 @@ struct T : public Thread {
     mymap[10] = "bar";
   }
 
-  void *entry() {
+  void *entry() override {
     while (num-- > 0)
       generic_dout(0) << "this is a typical log line.  set "
 		      << myset << " and map " << mymap << dendl;
@@ -28,8 +30,19 @@ struct T : public Thread {
   }
 };
 
+void usage(const char *name) {
+  cout << name << " <threads> <lines>\n"
+       << "\t threads: the number of threads for this test.\n"
+       << "\t lines: the number of log entries per thread.\n";
+}
+
 int main(int argc, const char **argv)
 {
+  if (argc < 3) {
+    usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
   int threads = atoi(argv[1]);
   int num = atoi(argv[2]);
 
@@ -37,11 +50,12 @@ int main(int argc, const char **argv)
 
   vector<const char*> args;
   argv_to_vec(argc, argv, args);
-  env_to_vec(args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_OSD, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_OSD,
+			 CODE_ENVIRONMENT_UTILITY,
+			 CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
 
-  utime_t start = ceph_clock_now(NULL);
+  utime_t start = ceph_clock_now();
 
   list<T*> ls;
   for (int i=0; i<threads; i++) {
@@ -57,13 +71,13 @@ int main(int argc, const char **argv)
     delete t;
   }
 
-  utime_t t = ceph_clock_now(NULL);
+  utime_t t = ceph_clock_now();
   t -= start;
   cout << " flushing.. " << t << " so far ..." << std::endl;
 
   g_ceph_context->_log->flush();
 
-  utime_t end = ceph_clock_now(NULL);
+  utime_t end = ceph_clock_now();
   utime_t dur = end - start;
 
   cout << dur << std::endl;

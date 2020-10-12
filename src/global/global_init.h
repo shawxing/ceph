@@ -17,32 +17,32 @@
 
 #include <stdint.h>
 #include <vector>
-
+#include <map>
+#include <boost/intrusive_ptr.hpp>
+#include "include/ceph_assert.h"
+#include "common/ceph_context.h"
 #include "common/code_environment.h"
 #include "common/common_init.h"
-
-class CephContext;
 
 /*
  * global_init is the first initialization function that
  * daemons and utility programs need to call. It takes care of a lot of
  * initialization, including setting up g_ceph_context.
  */
-void global_init(std::vector < const char * > *alt_def_args,
-		 std::vector < const char* >& args,
-		 uint32_t module_type,
-		 code_environment_t code_env,
-		 int flags,
-		 const char *data_dir_option = 0,
-		 bool run_pre_init = true);
+boost::intrusive_ptr<CephContext>
+global_init(
+  const std::map<std::string,std::string> *defaults,
+  std::vector < const char* >& args,
+  uint32_t module_type,
+  code_environment_t code_env,
+  int flags, bool run_pre_init = true);
 
 // just the first half; enough to get config parsed but doesn't start up the
 // cct or log.
-void global_pre_init(std::vector < const char * > *alt_def_args,
+void global_pre_init(const std::map<std::string,std::string> *defaults,
 		     std::vector < const char* >& args,
 		     uint32_t module_type, code_environment_t code_env,
-		     int flags,
-		     const char *data_dir_option = 0);
+		     int flags);
 
 /*
  * perform all of the steps that global_init_daemonize performs just prior
@@ -88,9 +88,14 @@ void global_init_chdir(const CephContext *cct);
  */
 int global_init_shutdown_stderr(CephContext *cct);
 
+/*
+ * Preload the erasure coding libraries to detect early issues with
+ * configuration.
+ */
+int global_init_preload_erasure_code(const CephContext *cct);
+
 /**
  * print daemon startup banner/warning
  */
 void global_print_banner(void);
-
 #endif

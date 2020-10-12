@@ -23,21 +23,27 @@ public:
   {
   }
 
-  virtual void send() = 0;
+  void send() override = 0;
 
 protected:
   const uint64_t m_snap_id;
 
-  virtual bool should_complete(int r);
-  virtual int filter_return_code(int r) const {
-    // never propagate an error back to the caller
-    return 0;
+  bool should_complete(int r) override;
+  int filter_return_code(int r) const override {
+    if (m_state == STATE_REQUEST) {
+      // never propagate an error back to the caller
+      return 0;
+    }
+    return r;
   }
   virtual void finish_request() {
   }
 
 private:
   /**
+   *              STATE_TIMEOUT --------\
+   *                   ^                |
+   *                   |                v
    * <start> ---> STATE_REQUEST ---> <finish>
    *                   |                ^
    *                   v                |
@@ -45,6 +51,7 @@ private:
    */
   enum State {
     STATE_REQUEST,
+    STATE_TIMEOUT,
     STATE_INVALIDATE
   };
 

@@ -4,6 +4,7 @@
 #include "test/rbd_mirror/test_mock_fixture.h"
 #include "include/rbd/librbd.hpp"
 #include "test/librados_test_stub/LibradosTestStub.h"
+#include "test/librados_test_stub/MockTestMemCluster.h"
 #include "test/librados_test_stub/MockTestMemRadosClient.h"
 #include "test/librbd/mock/MockImageCtx.h"
 
@@ -14,37 +15,34 @@ using ::testing::_;
 using ::testing::Invoke;
 using ::testing::WithArg;
 
-TestMockFixture::TestRadosClientPtr TestMockFixture::s_test_rados_client;
-::testing::NiceMock<librados::MockTestMemRadosClient> *
-  TestMockFixture::s_mock_rados_client = NULL;
+TestMockFixture::TestClusterRef TestMockFixture::s_test_cluster;
 
 void TestMockFixture::SetUpTestCase() {
-  s_test_rados_client = librados_test_stub::get_rados_client();
+  s_test_cluster = librados_test_stub::get_cluster();
 
   // use a mock version of the in-memory rados client
-  s_mock_rados_client = new ::testing::NiceMock<librados::MockTestMemRadosClient>(
-      s_test_rados_client->cct());
-  librados_test_stub::set_rados_client(TestRadosClientPtr(s_mock_rados_client));
+  librados_test_stub::set_cluster(boost::shared_ptr<librados::TestCluster>(
+    new ::testing::NiceMock<librados::MockTestMemCluster>()));
   TestFixture::SetUpTestCase();
 }
 
 void TestMockFixture::TearDownTestCase() {
   TestFixture::TearDownTestCase();
-  librados_test_stub::set_rados_client(s_test_rados_client);
-  s_test_rados_client->put();
-  s_test_rados_client.reset();
-}
-
-void TestMockFixture::SetUp() {
-  TestFixture::SetUp();
+  librados_test_stub::set_cluster(s_test_cluster);
 }
 
 void TestMockFixture::TearDown() {
-  TestFixture::TearDown();
-
   // Mock rados client lives across tests -- reset it to initial state
-  ::testing::Mock::VerifyAndClear(s_mock_rados_client);
-  s_mock_rados_client->default_to_dispatch();
+  librados::MockTestMemRadosClient *mock_rados_client =
+    get_mock_io_ctx(m_local_io_ctx).get_mock_rados_client();
+  ASSERT_TRUE(mock_rados_client != nullptr);
+
+  ::testing::Mock::VerifyAndClear(mock_rados_client);
+  mock_rados_client->default_to_dispatch();
+  dynamic_cast<librados::MockTestMemCluster*>(
+    librados_test_stub::get_cluster().get())->default_to_dispatch();
+
+  TestFixture::TearDown();
 }
 
 void TestMockFixture::expect_test_features(librbd::MockImageCtx &mock_image_ctx) {
@@ -52,6 +50,13 @@ void TestMockFixture::expect_test_features(librbd::MockImageCtx &mock_image_ctx)
     .WillRepeatedly(WithArg<0>(Invoke([&mock_image_ctx](uint64_t features) {
         return (mock_image_ctx.features & features) != 0;
       })));
+}
+
+librados::MockTestMemCluster& TestMockFixture::get_mock_cluster() {
+  librados::MockTestMemCluster* mock_cluster = dynamic_cast<
+    librados::MockTestMemCluster*>(librados_test_stub::get_cluster().get());
+  ceph_assert(mock_cluster != nullptr);
+  return *mock_cluster;
 }
 
 } // namespace mirror

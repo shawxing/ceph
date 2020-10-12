@@ -12,6 +12,7 @@
  *
  */
 
+#include "include/compat.h"
 #include "include/types.h"
 #include "include/buffer.h"
 #include "osd/osd_types.h"
@@ -19,10 +20,22 @@
 
 #include "HashIndex.h"
 
+#include "common/errno.h"
 #include "common/debug.h"
+#define dout_context cct
 #define dout_subsys ceph_subsys_filestore
 
+using std::map;
+using std::pair;
+using std::set;
+using std::string;
+using std::vector;
+
+using ceph::bufferptr;
+using ceph::bufferlist;
+
 const string HashIndex::SUBDIR_ATTR = "contents";
+const string HashIndex::SETTINGS_ATTR = "settings";
 const string HashIndex::IN_PROGRESS_OP_TAG = "in_progress_op";
 
 /// hex digit to integer value
@@ -32,13 +45,13 @@ int hex_to_int(char c)
     return c - '0';
   if (c >= 'A' && c <= 'F')
     return c - 'A' + 10;
-  assert(0);
+  ceph_abort();
 }
 
 /// int value to hex digit
 char int_to_hex(int v)
 {
-  assert(v < 16);
+  ceph_assert(v < 16);
   if (v < 10)
     return '0' + v;
   return 'A' + v - 10;
@@ -47,7 +60,7 @@ char int_to_hex(int v)
 /// reverse bits in a nibble (0..15)
 int reverse_nibble_bits(int in)
 {
-  assert(in < 16);
+  ceph_assert(in < 16);
   return
     ((in & 8) >> 3) |
     ((in & 4) >> 1) |
@@ -72,11 +85,11 @@ string reverse_hexdigit_bits_string(string s)
 /// compare hex digit (as length 1 string) bitwise
 bool cmp_hexdigit_bitwise(const string& l, const string& r)
 {
-  assert(l.length() == 1 && r.length() == 1);
+  ceph_assert(l.length() == 1 && r.length() == 1);
   int lv = hex_to_int(l[0]);
   int rv = hex_to_int(r[0]);
-  assert(lv < 16);
-  assert(rv < 16);
+  ceph_assert(lv < 16);
+  ceph_assert(rv < 16);
   return reverse_nibble_bits(lv) < reverse_nibble_bits(rv);
 }
 
@@ -95,7 +108,7 @@ int HashIndex::cleanup() {
     // No in progress operations!
     return 0;
   }
-  bufferlist::iterator i = bl.begin();
+  auto i = bl.cbegin();
   InProgressOp in_progress(i);
   subdir_info_s info;
   r = get_info(in_progress.path, &info);
@@ -288,12 +301,128 @@ int HashIndex::col_split_level(
   return 0;
 }
 
+int HashIndex::_merge(
+  uint32_t bits,
+  CollectionIndex* dest) {
+  dout(20) << __func__ << " bits " << bits << dendl;
+  ceph_assert(collection_version() == dest->collection_version());
+
+  vector<string> emptypath;
+
+  // pre-split to common/target level so that any shared prefix DIR_?
+  // directories already exist at the destination.  Since each
+  // directory is a nibble (4 bits),
+  unsigned shared = bits / 4;
+  dout(20) << __func__ << " pre-splitting to shared level " << shared << dendl;
+  if (shared) {
+    split_dirs(emptypath, shared);
+    ((HashIndex*)dest)->split_dirs(emptypath, shared);
+  }
+
+  // now merge the contents
+  _merge_dirs(*this, *(HashIndex*)dest, emptypath);
+
+  return 0;
+}
+
+int HashIndex::_merge_dirs(
+  HashIndex& from,
+  HashIndex& to,
+  const vector<string>& path)
+{
+  dout(20) << __func__ << " path " << path << dendl;
+  int r;
+
+  vector<string> src_subs, dst_subs;
+  r = from.list_subdirs(path, &src_subs);
+  if (r < 0) {
+    lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						  << " r " << r << " from "
+						  << "from.list_subdirs"
+						  << dendl;
+    return r;
+  }
+  r = to.list_subdirs(path, &dst_subs);
+  if (r < 0) {
+    lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						  << " r " << r << " from "
+						  << "to.list_subdirs"
+						  << dendl;
+    return r;
+  }
+
+  for (auto& i : src_subs) {
+    if (std::find(dst_subs.begin(), dst_subs.end(), i) == dst_subs.end()) {
+      // move it
+      r = move_subdir(from, to, path, i);
+      if (r < 0) {
+	lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						      << " r " << r << " from "
+						      << "move_subdir(...,"
+						      << path << "," << i << ")"
+						      << dendl;
+	return r;
+      }
+    } else {
+      // common, recurse!
+      vector<string> nested = path;
+      nested.push_back(i);
+      r = _merge_dirs(from, to, nested);
+      if (r < 0) {
+	lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						      << " r " << r << " from "
+						      << "rec _merge_dirs"
+						      << dendl;
+	return r;
+      }
+
+      // now remove it
+      r = remove_path(nested);
+      if (r < 0) {
+	lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						      << " r " << r << " from "
+						      << "remove_path "
+						      << nested
+						      << dendl;
+	return r;
+      }
+    }
+  }
+
+  // objects
+  map<string, ghobject_t> objects;
+  r = from.list_objects(path, 0, 0, &objects);
+  if (r < 0) {
+    lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						  << " r " << r << " from "
+						  << "from.list_objects"
+						  << dendl;
+    return r;
+  }
+
+  for (auto& i : objects) {
+    r = move_object(from, to, path, i);
+    if (r < 0) {
+      lgeneric_subdout(g_ceph_context,filestore,20) << __func__
+						    << " r " << r << " from "
+						    << "move_object(...,"
+						    << path << "," << i << ")"
+						    << dendl;
+      return r;
+    }
+  }
+
+  return 0;
+}
+
+
 int HashIndex::_split(
   uint32_t match,
   uint32_t bits,
   CollectionIndex* dest) {
-  assert(collection_version() == dest->collection_version());
+  ceph_assert(collection_version() == dest->collection_version());
   unsigned mkdirred = 0;
+
   return col_split_level(
     *this,
     *static_cast<HashIndex*>(dest),
@@ -303,10 +432,106 @@ int HashIndex::_split(
     &mkdirred);
 }
 
+int HashIndex::split_dirs(const vector<string> &path, int target_level) {
+  dout(20) << __func__ << " " << path << " target level: " 
+           << target_level << dendl;
+  subdir_info_s info;
+  int r = get_info(path, &info);
+  if (r < 0) {
+    dout(10) << "error looking up info for " << path << ": "
+	     << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  if (must_split(info, target_level)) {
+    dout(1) << __func__ << " " << path << " has " << info.objs
+            << " objects, " << info.hash_level 
+            << " level, starting split in pg " << coll() << "." << dendl;
+    r = initiate_split(path, info);
+    if (r < 0) {
+      dout(10) << "error initiating split on " << path << ": "
+	       << cpp_strerror(r) << dendl;
+      return r;
+    }
+
+    r = complete_split(path, info);
+    dout(1) << __func__ << " " << path << " split completed in pg " << coll() << "."
+            << dendl;
+    if (r < 0) {
+      dout(10) << "error completing split on " << path << ": "
+	       << cpp_strerror(r) << dendl;
+      return r;
+    }
+  }
+
+  vector<string> subdirs;
+  r = list_subdirs(path, &subdirs);
+  if (r < 0) {
+    dout(10) << "error listing subdirs of " << path << ": "
+	     << cpp_strerror(r) << dendl;
+    return r;
+  }
+  for (vector<string>::const_iterator it = subdirs.begin();
+       it != subdirs.end(); ++it) {
+    vector<string> subdir_path(path);
+    subdir_path.push_back(*it);
+    r = split_dirs(subdir_path, target_level);
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  return r;
+}
+
+int HashIndex::apply_layout_settings(int target_level) {
+  vector<string> path;
+  dout(10) << __func__ << " split multiple = " << split_multiplier
+	   << " merge threshold = " << merge_threshold
+	   << " split rand factor = " << cct->_conf->filestore_split_rand_factor
+	   << " target level = " << target_level
+	   << dendl;
+  int r = write_settings();
+  if (r < 0)
+    return r;
+  return split_dirs(path, target_level);
+}
+
 int HashIndex::_init() {
   subdir_info_s info;
   vector<string> path;
-  return set_info(path, info);
+  int r = set_info(path, info);
+  if (r < 0)
+    return r;
+  return write_settings();
+}
+
+int HashIndex::write_settings() {
+  if (cct->_conf->filestore_split_rand_factor > 0) {
+    settings.split_rand_factor = rand() % cct->_conf->filestore_split_rand_factor;
+  } else {
+    settings.split_rand_factor = 0;
+  }
+  vector<string> path;
+  bufferlist bl;
+  settings.encode(bl);
+  return add_attr_path(path, SETTINGS_ATTR, bl);
+}
+
+int HashIndex::read_settings() {
+  vector<string> path;
+  bufferlist bl;
+  int r = get_attr_path(path, SETTINGS_ATTR, bl);
+  if (r == -ENODATA)
+    return 0;
+  if (r < 0) {
+    derr << __func__ << " error reading settings: " << cpp_strerror(r) << dendl;
+    return r;
+  }
+  auto it = bl.cbegin();
+  settings.decode(it);
+  dout(20) << __func__ << " split_rand_factor = " << settings.split_rand_factor << dendl;
+  return 0;
 }
 
 /* LFNIndex virtual method implementations */
@@ -324,10 +549,15 @@ int HashIndex::_created(const vector<string> &path,
     return r;
 
   if (must_split(info)) {
+    dout(1) << __func__ << " " << path << " has " << info.objs
+            << " objects, starting split in pg " << coll() << "." << dendl;
     int r = initiate_split(path, info);
     if (r < 0)
       return r;
-    return complete_split(path, info);
+    r = complete_split(path, info);
+    dout(1) << __func__ << " " << path << " split completed in pg " << coll() << "."
+            << dendl;
+    return r;
   } else {
     return 0;
   }
@@ -385,7 +615,6 @@ int HashIndex::_lookup(const ghobject_t &oid,
 
 int HashIndex::_collection_list_partial(const ghobject_t &start,
 					const ghobject_t &end,
-					bool sort_bitwise,
 					int max_count,
 					vector<ghobject_t> *ls,
 					ghobject_t *next) {
@@ -395,7 +624,7 @@ int HashIndex::_collection_list_partial(const ghobject_t &start,
     next = &_next;
   *next = start;
   dout(20) << __func__ << " start:" << start << " end:" << end << "-" << max_count << " ls.size " << ls->size() << dendl;
-  return list_by_hash(path, end, sort_bitwise, max_count, next, ls);
+  return list_by_hash(path, end, max_count, next, ls);
 }
 
 int HashIndex::prep_delete() {
@@ -433,7 +662,7 @@ int HashIndex::pre_split_folder(uint32_t pg_num, uint64_t expected_num_objs)
 
   // Calculate the number of leaf folders (which actually store files)
   // need to be created
-  const uint64_t objs_per_folder = (uint64_t)(abs(merge_threshold)) * (uint64_t)split_multiplier * 16;
+  const uint64_t objs_per_folder = ((uint64_t)(abs(merge_threshold)) * (uint64_t)split_multiplier + settings.split_rand_factor) * 16;
   uint64_t leavies = expected_num_objs / objs_per_folder ;
   // No need to split
   if (leavies == 0 || expected_num_objs == objs_per_folder)
@@ -476,20 +705,21 @@ int HashIndex::pre_split_folder(uint32_t pg_num, uint64_t expected_num_objs)
   // the below logic is inspired by rados.h#ceph_stable_mod,
   // it basically determines how many sub-folders should we
   // create for splitting
-  assert(pg_num_bits > 0); // otherwise BAD_SHIFT
+  ceph_assert(pg_num_bits > 0); // otherwise BAD_SHIFT
   if (((1 << (pg_num_bits - 1)) | ps) >= pg_num) {
     ++split_bits;
   }
   const uint32_t subs = (1 << split_bits);
   // Calculate how many levels we create starting from here
   int level  = 0;
-  leavies /= subs;
-  while (leavies > 1) {
+  int level_limit = MAX_HASH_LEVEL - dump_num - 1;
+  uint64_t actual_leaves = subs;
+  while (actual_leaves < leavies && level < level_limit) {
     ++level;
-    leavies = leavies >> 4;
+    actual_leaves <<= 4;
   }
   for (uint32_t i = 0; i < subs; ++i) {
-    assert(split_bits <= 4); // otherwise BAD_SHIFT
+    ceph_assert(split_bits <= 4); // otherwise BAD_SHIFT
     int v = tmp_id | (i << ((4 - split_bits) % 4));
     paths.push_back(to_hex(v));
     ret = create_path(paths);
@@ -550,7 +780,12 @@ int HashIndex::recursive_create_path(vector<string>& path, int level)
 }
 
 int HashIndex::recursive_remove(const vector<string> &path) {
+  return _recursive_remove(path, true);
+}
+
+int HashIndex::_recursive_remove(const vector<string> &path, bool top) {
   vector<string> subdirs;
+  dout(20) << __func__ << " path=" << path << dendl;
   int r = list_subdirs(path, &subdirs);
   if (r < 0)
     return r;
@@ -565,12 +800,15 @@ int HashIndex::recursive_remove(const vector<string> &path) {
        i != subdirs.end();
        ++i) {
     subdir.push_back(*i);
-    r = recursive_remove(subdir);
+    r = _recursive_remove(subdir, false);
     if (r < 0)
       return r;
     subdir.pop_back();
   }
-  return remove_path(path);
+  if (top)
+    return 0;
+  else
+    return remove_path(path);
 }
 
 int HashIndex::start_col_split(const vector<string> &path) {
@@ -612,15 +850,15 @@ int HashIndex::get_info(const vector<string> &path, subdir_info_s *info) {
   int r = get_attr_path(path, SUBDIR_ATTR, buf);
   if (r < 0)
     return r;
-  bufferlist::iterator bufiter = buf.begin();
+  auto bufiter = buf.cbegin();
   info->decode(bufiter);
-  assert(path.size() == (unsigned)info->hash_level);
+  ceph_assert(path.size() == (unsigned)info->hash_level);
   return 0;
 }
 
 int HashIndex::set_info(const vector<string> &path, const subdir_info_s &info) {
   bufferlist buf;
-  assert(path.size() == (unsigned)info.hash_level);
+  ceph_assert(path.size() == (unsigned)info.hash_level);
   info.encode(buf);
   return add_attr_path(path, SUBDIR_ATTR, buf);
 }
@@ -632,10 +870,13 @@ bool HashIndex::must_merge(const subdir_info_s &info) {
 	  info.subdirs == 0);
 }
 
-bool HashIndex::must_split(const subdir_info_s &info) {
+bool HashIndex::must_split(const subdir_info_s &info, int target_level) {
+  // target_level is used for ceph-objectstore-tool to split dirs offline.
+  // if it is set (defalult is 0) and current hash level < target_level, 
+  // this dir would be split no matters how many objects it has.
   return (info.hash_level < (unsigned)MAX_HASH_LEVEL &&
-	  info.objs > ((unsigned)(abs(merge_threshold)) * 16 * split_multiplier));
-
+         ((target_level > 0 && info.hash_level < (unsigned)target_level) ||
+         (info.objs > ((unsigned)(abs(merge_threshold) * split_multiplier + settings.split_rand_factor) * 16))));
 }
 
 int HashIndex::initiate_merge(const vector<string> &path, subdir_info_s info) {
@@ -809,7 +1050,7 @@ string HashIndex::get_hash_str(uint32_t hash) {
 }
 
 string HashIndex::get_path_str(const ghobject_t &oid) {
-  assert(!oid.is_max());
+  ceph_assert(!oid.is_max());
   return get_hash_str(oid.hobj.get_hash());
 }
 
@@ -841,7 +1082,7 @@ int HashIndex::get_path_contents_by_hash_bitwise(
   for (map<string, ghobject_t>::iterator i = rev_objects.begin();
        i != rev_objects.end();
        ++i) {
-    if (next_object && cmp_bitwise(i->second, *next_object) < 0)
+    if (next_object && i->second < *next_object)
       continue;
     string hash_prefix = get_path_str(i->second);
     hash_prefixes->insert(hash_prefix);
@@ -884,73 +1125,14 @@ int HashIndex::get_path_contents_by_hash_bitwise(
   return 0;
 }
 
-int HashIndex::get_path_contents_by_hash_nibblewise(
-  const vector<string> &path,
-  const ghobject_t *next_object,
-  set<string> *hash_prefixes,
-  set<pair<string, ghobject_t>, CmpPairNibblewise > *objects)
-{
-  map<string, ghobject_t> rev_objects;
-  int r;
-  r = list_objects(path, 0, 0, &rev_objects);
-  if (r < 0)
-    return r;
-
-  for (map<string, ghobject_t>::iterator i = rev_objects.begin();
-       i != rev_objects.end();
-       ++i) {
-    string hash_prefix = get_path_str(i->second);
-    if (next_object && cmp_nibblewise(i->second, *next_object) < 0)
-      continue;
-    hash_prefixes->insert(hash_prefix);
-    objects->insert(pair<string, ghobject_t>(hash_prefix, i->second));
-  }
-
-  vector<string> subdirs;
-  r = list_subdirs(path, &subdirs);
-  if (r < 0)
-    return r;
-
-  // sort nibblewise (string sort of (reversed) hex digits)
-  std::sort(subdirs.begin(), subdirs.end());
-
-  string cur_prefix;
-  for (vector<string>::const_iterator i = path.begin();
-       i != path.end();
-       ++i) {
-    cur_prefix.append(*i);
-  }
-  string next_object_string;
-  if (next_object)
-    next_object_string = get_path_str(*next_object);
-
-  for (vector<string>::iterator i = subdirs.begin();
-       i != subdirs.end();
-       ++i) {
-    string candidate = cur_prefix + *i;
-    if (next_object) {
-      if (next_object->is_max())
-	continue;
-      if (candidate < next_object_string.substr(0, candidate.size()))
-	continue;
-    }
-    hash_prefixes->insert(cur_prefix + *i);
-  }
-  return 0;
-}
-
 int HashIndex::list_by_hash(const vector<string> &path,
 			    const ghobject_t &end,
-			    bool sort_bitwise,
 			    int max_count,
 			    ghobject_t *next,
 			    vector<ghobject_t> *out)
 {
-  assert(out);
-  if (sort_bitwise)
-    return list_by_hash_bitwise(path, end, max_count, next, out);
-  else
-    return list_by_hash_nibblewise(path, end, max_count, next, out);
+  ceph_assert(out);
+  return list_by_hash_bitwise(path, end, max_count, next, out);
 }
 
 int HashIndex::list_by_hash_bitwise(
@@ -1001,12 +1183,12 @@ int HashIndex::list_by_hash_bitwise(
 	    *next = j->second;
 	  return 0;
 	}
-	if (cmp_bitwise(j->second, end) >= 0) {
+	if (j->second >= end) {
 	  if (next)
-	    *next = ghobject_t::get_max();
+	    *next = j->second;
 	  return 0;
 	}
-	if (!next || cmp_bitwise(j->second, *next) >= 0) {
+	if (!next || j->second >= *next) {
 	  dout(20) << __func__ << " prefix " << *i << " ob " << j->second << dendl;
 	  out->push_back(j->second);
 	}
@@ -1019,67 +1201,4 @@ int HashIndex::list_by_hash_bitwise(
   return 0;
 }
 
-int HashIndex::list_by_hash_nibblewise(
-  const vector<string> &path,
-  const ghobject_t& end,
-  int max_count,
-  ghobject_t *next,
-  vector<ghobject_t> *out)
-{
-  vector<string> next_path = path;
-  next_path.push_back("");
-  set<string> hash_prefixes;
-  set<pair<string, ghobject_t>, CmpPairNibblewise> objects;
-  int r = get_path_contents_by_hash_nibblewise(path,
-					       next,
-					       &hash_prefixes,
-					       &objects);
-  if (r < 0)
-    return r;
-  for (set<string>::iterator i = hash_prefixes.begin();
-       i != hash_prefixes.end();
-       ++i) {
-    dout(20) << __func__ << " prefix " << *i << dendl;
-    set<pair<string, ghobject_t>, CmpPairNibblewise >::iterator j =
-      objects.lower_bound(make_pair(*i, ghobject_t()));
-    if (j == objects.end() || j->first != *i) {
-      *(next_path.rbegin()) = *(i->rbegin());
-      ghobject_t next_recurse;
-      if (next)
-	next_recurse = *next;
-      r = list_by_hash_nibblewise(next_path,
-				  end,
-				  max_count,
-				  &next_recurse,
-				  out);
 
-      if (r < 0)
-	return r;
-      if (!next_recurse.is_max()) {
-	if (next)
-	  *next = next_recurse;
-	return 0;
-      }
-    } else {
-      while (j != objects.end() && j->first == *i) {
-	if (max_count > 0 && out->size() == (unsigned)max_count) {
-	  if (next)
-	    *next = j->second;
-	  return 0;
-	}
-	if (cmp_nibblewise(j->second, end) >= 0) {
-	  if (next)
-	    *next = ghobject_t::get_max();
-	  return 0;
-	}
-	if (!next || cmp_nibblewise(j->second, *next) >= 0) {
-	  out->push_back(j->second);
-	}
-	++j;
-      }
-    }
-  }
-  if (next)
-    *next = ghobject_t::get_max();
-  return 0;
-}

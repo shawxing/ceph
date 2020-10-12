@@ -1,17 +1,17 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 
 #Generic create pool use crush rule  test
 #
 
 # Includes
-source ../qa/workunits/ceph-helpers.sh
+source ../qa/standalone/ceph-helpers.sh
 
 function run() {
     local dir=$1
     shift
 
-    export CEPH_MON="127.0.0.1:17109"
+    export CEPH_MON="127.0.0.1:17109" # git grep '\<17109\>' : there must be only one
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "

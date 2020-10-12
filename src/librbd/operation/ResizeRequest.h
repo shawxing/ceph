@@ -18,16 +18,17 @@ template <typename ImageCtxT = ImageCtx>
 class ResizeRequest : public Request<ImageCtxT> {
 public:
   static ResizeRequest *create(ImageCtxT &image_ctx, Context *on_finish,
-                               uint64_t new_size, ProgressContext &prog_ctx,
-                               uint64_t journal_op_tid, bool disable_journal) {
-    return new ResizeRequest(image_ctx, on_finish, new_size, prog_ctx,
+                               uint64_t new_size, bool allow_shrink,
+                               ProgressContext &prog_ctx, uint64_t journal_op_tid,
+                               bool disable_journal) {
+    return new ResizeRequest(image_ctx, on_finish, new_size, allow_shrink, prog_ctx,
                              journal_op_tid, disable_journal);
   }
 
   ResizeRequest(ImageCtxT &image_ctx, Context *on_finish, uint64_t new_size,
-                ProgressContext &prog_ctx, uint64_t journal_op_tid,
+                bool allow_shrink, ProgressContext &prog_ctx, uint64_t journal_op_tid,
                 bool disable_journal);
-  virtual ~ResizeRequest();
+  ~ResizeRequest() override;
 
   inline bool shrinking() const {
     return (m_shrink_size_visible && m_new_size < m_original_size);
@@ -37,17 +38,17 @@ public:
     return m_new_size;
   }
 
-  virtual void send();
+  void send() override;
 
 protected:
-  virtual void send_op();
-  virtual bool should_complete(int r) {
+  void send_op() override;
+  bool should_complete(int r) override {
     return true;
   }
-  virtual bool can_affect_io() const override {
+  bool can_affect_io() const override {
     return true;
   }
-  virtual journal::Event create_event(uint64_t op_tid) const {
+  journal::Event create_event(uint64_t op_tid) const override {
     return journal::ResizeEvent(op_tid, m_new_size);
   }
 
@@ -66,23 +67,24 @@ private:
    *    v
    * STATE_APPEND_OP_EVENT (skip if journaling
    *    |                   disabled)
-   *    | (unblock writes)
-   *    |
    *    |
    *    | (grow)
    *    |\--------> STATE_GROW_OBJECT_MAP (skip if object map
    *    |                 |                disabled)
    *    |                 v
-   *    |           STATE_POST_BLOCK_WRITES
-   *    |                 |
-   *    |                 v
    *    |           STATE_UPDATE_HEADER ----------------------------\
+   *    |                                 (unblock writes)          |
+   *    |                                                           |
+   *    | (unblock writes)                                          |
    *    |                                                           |
    *    | (shrink)                                                  |
-   *    |\--------> STATE_TRIM_IMAGE                                |
+   *    |\--------> STATE_FLUSH_CACHE                               |
    *    |                 |                                         |
    *    |                 v                                         |
    *    |           STATE_INVALIDATE_CACHE                          |
+   *    |                 |                                         |
+   *    |                 v                                         |
+   *    |           STATE_TRIM_IMAGE                                |
    *    |                 |                                         |
    *    |                 v                                         |
    *    |           STATE_POST_BLOCK_WRITES                         |
@@ -106,6 +108,7 @@ private:
 
   uint64_t m_original_size;
   uint64_t m_new_size;
+  bool m_allow_shrink = true;
   ProgressContext &m_prog_ctx;
   uint64_t m_new_parent_overlap;
   bool m_shrink_size_visible = false;
@@ -118,6 +121,9 @@ private:
 
   Context *send_append_op_event();
   Context *handle_append_op_event(int *result);
+
+  void send_flush_cache();
+  Context *handle_flush_cache(int *result);
 
   void send_invalidate_cache();
   Context *handle_invalidate_cache(int *result);

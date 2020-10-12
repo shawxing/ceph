@@ -3,10 +3,8 @@
 
 #include "librbd/object_map/InvalidateRequest.h"
 #include "common/dout.h"
-#include "common/errno.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/ImageWatcher.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -25,8 +23,8 @@ InvalidateRequest<I>* InvalidateRequest<I>::create(I &image_ctx,
 template <typename I>
 void InvalidateRequest<I>::send() {
   I &image_ctx = this->m_image_ctx;
-  assert(image_ctx.owner_lock.is_locked());
-  assert(image_ctx.snap_lock.is_wlocked());
+  ceph_assert(ceph_mutex_is_locked(image_ctx.owner_lock));
+  ceph_assert(ceph_mutex_is_wlocked(image_ctx.image_lock));
 
   uint64_t snap_flags;
   int r = image_ctx.get_flags(m_snap_id, &snap_flags);
@@ -55,23 +53,19 @@ void InvalidateRequest<I>::send() {
       (!m_force && m_snap_id == CEPH_NOSNAP &&
        image_ctx.exclusive_lock != nullptr &&
        !image_ctx.exclusive_lock->is_lock_owner())) {
-    this->async_complete(0);
+    this->async_complete(-EROFS);
     return;
   }
 
   lderr(cct) << this << " invalidating object map on-disk" << dendl;
   librados::ObjectWriteOperation op;
-  if (image_ctx.exclusive_lock != nullptr &&
-      m_snap_id == CEPH_NOSNAP && !m_force) {
-    image_ctx.exclusive_lock->assert_header_locked(&op);
-  }
   cls_client::set_flags(&op, m_snap_id, flags, flags);
 
   librados::AioCompletion *rados_completion =
     this->create_callback_completion();
   r = image_ctx.md_ctx.aio_operate(image_ctx.header_oid, rados_completion,
-                                     &op);
-  assert(r == 0);
+                                   &op);
+  ceph_assert(r == 0);
   rados_completion->release();
 }
 

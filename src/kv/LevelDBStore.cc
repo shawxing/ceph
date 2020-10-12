@@ -5,15 +5,27 @@
 #include <set>
 #include <map>
 #include <string>
-#include "include/memory.h"
-#include <errno.h>
-using std::string;
+#include <cerrno>
+
 #include "common/debug.h"
 #include "common/perf_counters.h"
 
+// re-include our assert to clobber the system one; fix dout:
+#include "include/ceph_assert.h"
+
+#define dout_context cct
 #define dout_subsys ceph_subsys_leveldb
 #undef dout_prefix
 #define dout_prefix *_dout << "leveldb: "
+
+using std::list;
+using std::string;
+using std::ostream;
+using std::pair;
+using std::vector;
+
+using ceph::bufferlist;
+using ceph::bufferptr;
 
 class CephLevelDBLogger : public leveldb::Logger {
   CephContext *cct;
@@ -21,12 +33,12 @@ public:
   explicit CephLevelDBLogger(CephContext *c) : cct(c) {
     cct->get();
   }
-  ~CephLevelDBLogger() {
+  ~CephLevelDBLogger() override {
     cct->put();
   }
 
   // Write an entry to the log file with the specified format.
-  void Logv(const char* format, va_list ap) {
+  void Logv(const char* format, va_list ap) override {
     dout(1);
     char buf[65536];
     vsnprintf(buf, sizeof(buf), format, ap);
@@ -43,21 +55,33 @@ int LevelDBStore::init(string option_str)
 {
   // init defaults.  caller can override these if they want
   // prior to calling open.
-  options.write_buffer_size = g_conf->leveldb_write_buffer_size;
-  options.cache_size = g_conf->leveldb_cache_size;
-  options.block_size = g_conf->leveldb_block_size;
-  options.bloom_size = g_conf->leveldb_bloom_size;
-  options.compression_enabled = g_conf->leveldb_compression;
-  options.paranoid_checks = g_conf->leveldb_paranoid;
-  options.max_open_files = g_conf->leveldb_max_open_files;
-  options.log_file = g_conf->leveldb_log;
+  options.write_buffer_size = g_conf()->leveldb_write_buffer_size;
+  options.cache_size = g_conf()->leveldb_cache_size;
+  options.block_size = g_conf()->leveldb_block_size;
+  options.bloom_size = g_conf()->leveldb_bloom_size;
+  options.compression_enabled = g_conf()->leveldb_compression;
+  options.paranoid_checks = g_conf()->leveldb_paranoid;
+  options.max_open_files = g_conf()->leveldb_max_open_files;
+  options.log_file = g_conf()->leveldb_log;
   return 0;
 }
 
-int LevelDBStore::do_open(ostream &out, bool create_if_missing)
-{
-  leveldb::Options ldoptions;
+int LevelDBStore::open(ostream &out, const std::string& cfs)  {
+  if (!cfs.empty()) {
+    ceph_abort_msg("Not implemented");
+  }
+  return do_open(out, false);
+}
 
+int LevelDBStore::create_and_open(ostream &out, const std::string& cfs) {
+  if (!cfs.empty()) {
+    ceph_abort_msg("Not implemented");
+  }
+  return do_open(out, true);
+}
+
+int LevelDBStore::load_leveldb_options(bool create_if_missing, leveldb::Options &ldoptions)
+{
   if (options.write_buffer_size)
     ldoptions.write_buffer_size = options.write_buffer_size;
   if (options.max_open_files)
@@ -76,7 +100,7 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
     filterpolicy.reset(_filterpolicy);
     ldoptions.filter_policy = filterpolicy.get();
 #else
-    assert(0 == "bloom size set but installed leveldb doesn't support bloom filters");
+    ceph_abort_msg(0 == "bloom size set but installed leveldb doesn't support bloom filters");
 #endif
   }
   if (options.compression_enabled)
@@ -90,7 +114,7 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
   ldoptions.paranoid_checks = options.paranoid_checks;
   ldoptions.create_if_missing = create_if_missing;
 
-  if (g_conf->leveldb_log_to_ceph_log) {
+  if (g_conf()->leveldb_log_to_ceph_log) {
     ceph_logger = new CephLevelDBLogger(g_ceph_context);
     ldoptions.info_log = ceph_logger;
   }
@@ -98,6 +122,17 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
   if (options.log_file.length()) {
     leveldb::Env *env = leveldb::Env::Default();
     env->NewLogger(options.log_file, &ldoptions.info_log);
+  }
+  return 0;
+}
+
+int LevelDBStore::do_open(ostream &out, bool create_if_missing)
+{
+  leveldb::Options ldoptions;
+  int r = load_leveldb_options(create_if_missing, ldoptions);
+  if (r) {
+    dout(1) << "load leveldb options failed" << dendl;
+    return r;
   }
 
   leveldb::DB *_db;
@@ -121,7 +156,7 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
   logger = plb.create_perf_counters();
   cct->get_perfcounters_collection()->add(logger);
 
-  if (g_conf->leveldb_compact_on_mount) {
+  if (g_conf()->leveldb_compact_on_mount) {
     derr << "Compacting leveldb store..." << dendl;
     compact();
     derr << "Finished compacting leveldb store" << dendl;
@@ -142,37 +177,57 @@ int LevelDBStore::_test_init(const string& dir)
 LevelDBStore::~LevelDBStore()
 {
   close();
-  delete logger;
-  delete ceph_logger;
-
-  // Ensure db is destroyed before dependent db_cache and filterpolicy
-  db.reset();
 }
 
 void LevelDBStore::close()
 {
   // stop compaction thread
-  compact_queue_lock.Lock();
+  compact_queue_lock.lock();
   if (compact_thread.is_started()) {
     compact_queue_stop = true;
-    compact_queue_cond.Signal();
-    compact_queue_lock.Unlock();
+    compact_queue_cond.notify_all();
+    compact_queue_lock.unlock();
     compact_thread.join();
   } else {
-    compact_queue_lock.Unlock();
+    compact_queue_lock.unlock();
   }
 
-  if (logger)
+  if (logger) {
     cct->get_perfcounters_collection()->remove(logger);
+    delete logger;
+    logger = nullptr;
+  }
+
+  // Ensure db is destroyed before dependent db_cache and filterpolicy
+  db.reset();
+  delete ceph_logger;
+}
+
+int LevelDBStore::repair(std::ostream &out)
+{
+  leveldb::Options ldoptions;
+  int r = load_leveldb_options(false, ldoptions);
+  if (r) {
+    dout(1) << "load leveldb options failed" << dendl;
+    out << "load leveldb options failed" << std::endl;
+    return r;
+  }
+  leveldb::Status status = leveldb::RepairDB(path, ldoptions);
+  if (status.ok()) {
+    return 0;
+  } else {
+    out << "repair leveldb failed : " << status.ToString() << std::endl;
+    return 1;
+  }
 }
 
 int LevelDBStore::submit_transaction(KeyValueDB::Transaction t)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   LevelDBTransactionImpl * _t =
     static_cast<LevelDBTransactionImpl *>(t.get());
   leveldb::Status s = db->Write(leveldb::WriteOptions(), &(_t->bat));
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_leveldb_txns);
   logger->tinc(l_leveldb_submit_latency, lat);
   return s.ok() ? 0 : -1;
@@ -180,13 +235,13 @@ int LevelDBStore::submit_transaction(KeyValueDB::Transaction t)
 
 int LevelDBStore::submit_transaction_sync(KeyValueDB::Transaction t)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   LevelDBTransactionImpl * _t =
     static_cast<LevelDBTransactionImpl *>(t.get());
   leveldb::WriteOptions options;
   options.sync = true;
   leveldb::Status s = db->Write(options, &(_t->bat));
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_leveldb_txns);
   logger->tinc(l_leveldb_submit_sync_latency, lat);
   return s.ok() ? 0 : -1;
@@ -209,10 +264,9 @@ void LevelDBStore::LevelDBTransactionImpl::set(
     // make sure the buffer isn't too large or we might crash here...    
     char* slicebuf = (char*) alloca(bllen);
     leveldb::Slice newslice(slicebuf, bllen);
-    std::list<buffer::ptr>::const_iterator pb;
-    for (pb = to_set_bl.buffers().begin(); pb != to_set_bl.buffers().end(); ++pb) {
-      size_t ptrlen = (*pb).length();
-      memcpy((void*)slicebuf, (*pb).c_str(), ptrlen);
+    for (const auto& node : to_set_bl.buffers()) {
+      const size_t ptrlen = node.length();
+      memcpy(static_cast<void*>(slicebuf), node.c_str(), ptrlen);
       slicebuf += ptrlen;
     } 
     bat.Put(leveldb::Slice(key), newslice);
@@ -236,8 +290,20 @@ void LevelDBStore::LevelDBTransactionImpl::rmkeys_by_prefix(const string &prefix
   for (it->seek_to_first();
        it->valid();
        it->next()) {
-    string key = combine_strings(prefix, it->key());
-    bat.Delete(key);
+    bat.Delete(leveldb::Slice(combine_strings(prefix, it->key())));
+  }
+}
+
+void LevelDBStore::LevelDBTransactionImpl::rm_range_keys(const string &prefix, const string &start, const string &end)
+{
+  KeyValueDB::Iterator it = db->get_iterator(prefix);
+  it->lower_bound(start);
+  while (it->valid()) {
+    if (it->key() >= end) {
+      break;
+    }
+    bat.Delete(combine_strings(prefix, it->key()));
+    it->next();
   }
 }
 
@@ -246,38 +312,38 @@ int LevelDBStore::get(
     const std::set<string> &keys,
     std::map<string, bufferlist> *out)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
-  KeyValueDB::Iterator it = get_iterator(prefix);
+  utime_t start = ceph_clock_now();
   for (std::set<string>::const_iterator i = keys.begin();
-       i != keys.end();
-       ++i) {
-    it->lower_bound(*i);
-    if (it->valid() && it->key() == *i) {
-      out->insert(make_pair(*i, it->value()));
-    } else if (!it->valid())
-      break;
+       i != keys.end(); ++i) {
+    std::string value;
+    std::string bound = combine_strings(prefix, *i);
+    auto status = db->Get(leveldb::ReadOptions(), leveldb::Slice(bound), &value);
+    if (status.ok())
+      (*out)[*i].append(value);
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_leveldb_gets);
   logger->tinc(l_leveldb_get_latency, lat);
   return 0;
 }
 
 int LevelDBStore::get(const string &prefix, 
-		  const string &key,
-		  bufferlist *value)
+      const string &key,
+      bufferlist *out)
 {
-  assert(value && (value->length() == 0));
-  utime_t start = ceph_clock_now(g_ceph_context);
+  ceph_assert(out && (out->length() == 0));
+  utime_t start = ceph_clock_now();
   int r = 0;
-  KeyValueDB::Iterator it = get_iterator(prefix);
-  it->lower_bound(key);
-  if (it->valid() && it->key() == key) {
-    value->append(it->value_as_ptr());
+  string value, k;
+  leveldb::Status s;
+  k = combine_strings(prefix, key);
+  s = db->Get(leveldb::ReadOptions(), leveldb::Slice(k), &value);
+  if (s.ok()) {
+    out->append(value);
   } else {
     r = -ENOENT;
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_leveldb_gets);
   logger->tinc(l_leveldb_get_latency, lat);
   return r;
@@ -326,26 +392,31 @@ void LevelDBStore::compact()
 
 void LevelDBStore::compact_thread_entry()
 {
-  compact_queue_lock.Lock();
+  std::unique_lock l{compact_queue_lock};
   while (!compact_queue_stop) {
     while (!compact_queue.empty()) {
       pair<string,string> range = compact_queue.front();
       compact_queue.pop_front();
       logger->set(l_leveldb_compact_queue_len, compact_queue.size());
-      compact_queue_lock.Unlock();
+      l.unlock();
       logger->inc(l_leveldb_compact_range);
-      compact_range(range.first, range.second);
-      compact_queue_lock.Lock();
+      if (range.first.empty() && range.second.empty()) {
+        compact();
+      } else {
+        compact_range(range.first, range.second);
+      }
+      l.lock();
       continue;
     }
-    compact_queue_cond.Wait(compact_queue_lock);
+    if (compact_queue_stop)
+      break;
+    compact_queue_cond.wait(l);
   }
-  compact_queue_lock.Unlock();
 }
 
 void LevelDBStore::compact_range_async(const string& start, const string& end)
 {
-  Mutex::Locker l(compact_queue_lock);
+  std::lock_guard l(compact_queue_lock);
 
   // try to merge adjacent ranges.  this is O(n), but the queue should
   // be short.  note that we do not cover all overlap cases and merge
@@ -377,7 +448,7 @@ void LevelDBStore::compact_range_async(const string& start, const string& end)
     compact_queue.push_back(make_pair(start, end));
     logger->set(l_leveldb_compact_queue_len, compact_queue.size());
   }
-  compact_queue_cond.Signal();
+  compact_queue_cond.notify_all();
   if (!compact_thread.is_started()) {
     compact_thread.create("levdbst_compact");
   }

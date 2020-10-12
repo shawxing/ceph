@@ -14,10 +14,8 @@
 #ifndef CEPH_WATCH_H
 #define CEPH_WATCH_H
 
-#include "include/memory.h"
 #include <set>
-
-#include "msg/Messenger.h"
+#include "msg/Connection.h"
 #include "include/Context.h"
 
 enum WatcherState {
@@ -26,19 +24,19 @@ enum WatcherState {
 };
 
 class OSDService;
-class ReplicatedPG;
-void intrusive_ptr_add_ref(ReplicatedPG *pg);
-void intrusive_ptr_release(ReplicatedPG *pg);
+class PrimaryLogPG;
+void intrusive_ptr_add_ref(PrimaryLogPG *pg);
+void intrusive_ptr_release(PrimaryLogPG *pg);
 struct ObjectContext;
 class MWatchNotify;
 
 class Watch;
-typedef ceph::shared_ptr<Watch> WatchRef;
-typedef ceph::weak_ptr<Watch> WWatchRef;
+typedef std::shared_ptr<Watch> WatchRef;
+typedef std::weak_ptr<Watch> WWatchRef;
 
 class Notify;
-typedef ceph::shared_ptr<Notify> NotifyRef;
-typedef ceph::weak_ptr<Notify> WNotifyRef;
+typedef std::shared_ptr<Notify> NotifyRef;
+typedef std::weak_ptr<Notify> WNotifyRef;
 
 struct CancelableContext;
 
@@ -47,7 +45,6 @@ struct CancelableContext;
  *
  * References are held by Watch and the timeout callback.
  */
-class NotifyTimeoutCB;
 class Notify {
   friend class NotifyTimeoutCB;
   friend class Watch;
@@ -57,9 +54,9 @@ class Notify {
   bool complete;
   bool discarded;
   bool timed_out;  ///< true if the notify timed out
-  set<WatchRef> watchers;
+  std::set<WatchRef> watchers;
 
-  bufferlist payload;
+  ceph::buffer::list payload;
   uint32_t timeout;
   uint64_t cookie;
   uint64_t notify_id;
@@ -67,10 +64,10 @@ class Notify {
 
   OSDService *osd;
   CancelableContext *cb;
-  Mutex lock;
+  ceph::mutex lock = ceph::make_mutex("Notify::lock");
 
   /// (gid,cookie) -> reply_bl for everyone who acked the notify
-  multimap<pair<uint64_t,uint64_t>,bufferlist> notify_replies;
+  std::multimap<std::pair<uint64_t,uint64_t>, ceph::buffer::list> notify_replies;
 
   /// true if this notify is being discarded
   bool is_discarded() {
@@ -86,7 +83,7 @@ class Notify {
   Notify(
     ConnectionRef client,
     uint64_t client_gid,
-    bufferlist &payload,
+    ceph::buffer::list& payload,
     uint32_t timeout,
     uint64_t cookie,
     uint64_t notify_id,
@@ -100,12 +97,10 @@ class Notify {
   void unregister_cb();
 public:
 
-  string gen_dbg_prefix() {
-    stringstream ss;
-    ss << "Notify(" << make_pair(cookie, notify_id) << " "
-       << " watchers=" << watchers.size()
-       << ") ";
-    return ss.str();
+  std::ostream& gen_dbg_prefix(std::ostream& out) {
+    return out << "Notify(" << std::make_pair(cookie, notify_id) << " "
+        << " watchers=" << watchers.size()
+        << ") ";
   }
   void set_self(NotifyRef _self) {
     self = _self;
@@ -113,7 +108,7 @@ public:
   static NotifyRef makeNotifyRef(
     ConnectionRef client,
     uint64_t client_gid,
-    bufferlist &payload,
+    ceph::buffer::list &payload,
     uint32_t timeout,
     uint64_t cookie,
     uint64_t notify_id,
@@ -131,7 +126,7 @@ public:
   /// Called once per NotifyAck
   void complete_watcher(
     WatchRef watcher, ///< [in] watcher to complete
-    bufferlist& reply_bl ///< [in] reply buffer from the notified watcher
+    ceph::buffer::list& reply_bl ///< [in] reply buffer from the notified watcher
     );
   /// Called when a watcher unregisters or times out
   void complete_watcher_remove(
@@ -157,8 +152,8 @@ class Watch {
   CancelableContext *cb;
 
   OSDService *osd;
-  boost::intrusive_ptr<ReplicatedPG> pg;
-  ceph::shared_ptr<ObjectContext> obc;
+  boost::intrusive_ptr<PrimaryLogPG> pg;
+  std::shared_ptr<ObjectContext> obc;
 
   std::map<uint64_t, NotifyRef> in_progress_notifies;
 
@@ -168,14 +163,14 @@ class Watch {
   entity_addr_t addr;
 
   bool will_ping;    ///< is client new enough to ping the watch
-  utime_t last_ping; ///< last cilent ping
+  utime_t last_ping; ///< last client ping
 
   entity_name_t entity;
   bool discarded;
 
   Watch(
-    ReplicatedPG *pg, OSDService *osd,
-    ceph::shared_ptr<ObjectContext> obc, uint32_t timeout,
+    PrimaryLogPG *pg, OSDService *osd,
+    std::shared_ptr<ObjectContext> obc, uint32_t timeout,
     uint64_t cookie, entity_name_t entity,
     const entity_addr_t& addr);
 
@@ -197,10 +192,11 @@ public:
     return last_ping;
   }
 
-  bool is_connected() {
+  /// True if currently connected
+  bool is_connected() const {
     return conn.get() != NULL;
   }
-  bool is_connected(Connection *con) {
+  bool is_connected(Connection *con) const {
     return conn.get() == con;
   }
 
@@ -211,18 +207,18 @@ public:
     return entity.num();
   }
 
-  string gen_dbg_prefix();
+  std::ostream& gen_dbg_prefix(std::ostream& out);
   static WatchRef makeWatchRef(
-    ReplicatedPG *pg, OSDService *osd,
-    ceph::shared_ptr<ObjectContext> obc, uint32_t timeout, uint64_t cookie, entity_name_t entity, const entity_addr_t &addr);
+    PrimaryLogPG *pg, OSDService *osd,
+    std::shared_ptr<ObjectContext> obc, uint32_t timeout, uint64_t cookie, entity_name_t entity, const entity_addr_t &addr);
   void set_self(WatchRef _self) {
     self = _self;
   }
 
   /// Does not grant a ref count!
-  boost::intrusive_ptr<ReplicatedPG> get_pg() { return pg; }
+  boost::intrusive_ptr<PrimaryLogPG> get_pg() { return pg; }
 
-  ceph::shared_ptr<ObjectContext> get_obc() { return obc; }
+  std::shared_ptr<ObjectContext> get_obc() { return obc; }
 
   uint64_t get_cookie() const { return cookie; }
   entity_name_t get_entity() const { return entity; }
@@ -231,9 +227,6 @@ public:
 
   /// Generates context for use if watch timeout is delayed by scrub or recovery
   Context *get_delayed_cb();
-
-  /// True if currently connected
-  bool connected();
 
   /// Transitions Watch to connected, unregister_cb, resends pending Notifies
   void connect(
@@ -248,7 +241,7 @@ public:
   void discard();
 
   /// True if removed or discarded
-  bool is_discarded();
+  bool is_discarded() const;
 
   /// Called on unwatch
   void remove(bool send_disconnect);
@@ -266,19 +259,20 @@ public:
   /// Call when notify_ack received on notify_id
   void notify_ack(
     uint64_t notify_id, ///< [in] id of acked notify
-    bufferlist& reply_bl ///< [in] notify reply buffer
+    ceph::buffer::list& reply_bl ///< [in] notify reply buffer
     );
 };
 
 /**
  * Holds weak refs to Watch structures corresponding to a connection
- * Lives in the OSD::Session object of an OSD connection
+ * Lives in the Session object of an OSD connection
  */
 class WatchConState {
-  Mutex lock;
+  ceph::mutex lock = ceph::make_mutex("WatchConState");
   std::set<WatchRef> watches;
 public:
-  WatchConState() : lock("WatchConState") {}
+  CephContext* cct;
+  explicit WatchConState(CephContext* cct) : cct(cct) {}
 
   /// Add a watch
   void addWatch(

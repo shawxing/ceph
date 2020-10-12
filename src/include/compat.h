@@ -12,15 +12,107 @@
 #ifndef CEPH_COMPAT_H
 #define CEPH_COMPAT_H
 
-#if defined(__FreeBSD__)
-#define	ENODATA	ENOATTR
-#define	MSG_MORE 0
-#endif /* !__FreeBSD__ */
+#include "acconfig.h"
+#include <sys/types.h>
+#include <errno.h>
 
-#if defined(__APPLE__)
-/* PATH_MAX */
+#if defined(__linux__)
+#define PROCPREFIX
+#endif
+
+#include <sys/stat.h>
+#ifndef ACCESSPERMS
+#define ACCESSPERMS (S_IRWXU|S_IRWXG|S_IRWXO)
+#endif
+
+#if defined(__FreeBSD__)
+
+// FreeBSD supports Linux procfs with its compatibility module
+// And all compatibility stuff is standard mounted on this 
+#define PROCPREFIX "/compat/linux"
+
+#ifndef MSG_MORE
+#define MSG_MORE 0
+#endif
+
+#ifndef O_DSYNC
+#define O_DSYNC O_SYNC
+#endif
+
+/* And include the extra required include file */
+#include <pthread_np.h>
+
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#define cpu_set_t cpuset_t
+int sched_setaffinity(pid_t pid, size_t cpusetsize,
+                      cpu_set_t *mask);
+
+#endif /* __FreeBSD__ */
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
+/* Make sure that ENODATA is defined in the correct way */
+#ifdef ENODATA
+#if (ENODATA == 9919)
+// #warning ENODATA already defined to be 9919, redefining to fix
+// Silencing this warning because it fires at all files where compat.h
+// is included after boost files.
+//
+// This value stems from the definition in the boost library
+// And when this case occurs it is due to the fact that boost files
+// are included before this file. Redefinition might not help in this
+// case since already parsed code has evaluated to the wrong value.
+// This would warrrant for d definition that would actually be evaluated
+// at the location of usage and report a possible conflict.
+// This is left up to a future improvement
+#elif (ENODATA != 87)
+// #warning ENODATA already defined to a value different from 87 (ENOATRR), refining to fix
+#endif
+#undef ENODATA
+#endif
+#define ENODATA ENOATTR
+
+// Fix clock accuracy
+#if !defined(CLOCK_MONOTONIC_COARSE)
+#if defined(CLOCK_MONOTONIC_FAST)
+#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC_FAST
+#else
+#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
+#endif
+#endif
+#if !defined(CLOCK_REALTIME_COARSE)
+#if defined(CLOCK_REALTIME_FAST)
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME_FAST
+#else
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#endif
+
+/* get PATH_MAX */
 #include <limits.h>
+
+#ifndef EUCLEAN
+#define EUCLEAN 117
+#endif
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
+#ifndef EKEYREJECTED
+#define EKEYREJECTED 129
+#endif
+#ifndef XATTR_CREATE
+#define XATTR_CREATE 1
+#endif
+
 #endif /* __APPLE__ */
+
+#ifndef HOST_NAME_MAX
+#ifdef MAXHOSTNAMELEN 
+#define HOST_NAME_MAX MAXHOSTNAMELEN 
+#else
+#define HOST_NAME_MAX 255
+#endif
+#endif /* HOST_NAME_MAX */
 
 /* O_LARGEFILE is not defined/required on OSX/FreeBSD */
 #ifndef O_LARGEFILE
@@ -63,5 +155,192 @@
 #if defined(_AIX)
 #define MSG_DONTWAIT MSG_NONBLOCK
 #endif
+
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+  #if defined(__APPLE__)
+    #define ceph_pthread_setname(thread, name) ({ \
+      int __result = 0;                         \
+      if (thread == pthread_self())             \
+        __result = pthread_setname_np(name);    \
+      __result; })
+  #else
+    #define ceph_pthread_setname pthread_setname_np
+  #endif
+#elif defined(HAVE_PTHREAD_SET_NAME_NP)
+  /* Fix a small name diff and return 0 */
+  #define ceph_pthread_setname(thread, name) ({ \
+    pthread_set_name_np(thread, name);          \
+    0; })
+#else
+  /* compiler warning free success noop */
+  #define ceph_pthread_setname(thread, name) ({ \
+    int __i = 0;                              \
+    __i; })
+#endif
+
+#if defined(HAVE_PTHREAD_GETNAME_NP)
+  #define ceph_pthread_getname pthread_getname_np
+#elif defined(HAVE_PTHREAD_GET_NAME_NP)
+  #define ceph_pthread_getname(thread, name, len) ({ \
+    pthread_get_name_np(thread, name, len);          \
+    0; })
+#else
+  /* compiler warning free success noop */
+  #define ceph_pthread_getname(thread, name, len) ({ \
+    if (name != NULL)                              \
+      *name = '\0';                                \
+    0; })
+#endif
+
+int ceph_posix_fallocate(int fd, off_t offset, off_t len);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int pipe_cloexec(int pipefd[2], int flags);
+char *ceph_strerror_r(int errnum, char *buf, size_t buflen);
+
+#ifdef __cplusplus
+}
+#endif
+
+#if defined(_WIN32)
+
+#include "include/win32/winsock_compat.h"
+
+#include <windows.h>
+
+// There are a few name collisions between Windows headers and Ceph.
+// Updating Ceph definitions would be the prefferable fix in order to avoid
+// confussion, unless it requires too many changes, in which case we're going
+// to redefine Windows values by adding the "WIN32_" prefix.
+#define WIN32_DELETE 0x00010000L
+#undef DELETE
+
+#define WIN32_ERROR 0
+#undef ERROR
+
+typedef _sigset_t sigset_t;
+
+typedef int uid_t;
+typedef int gid_t;
+
+typedef long blksize_t;
+typedef long blkcnt_t;
+typedef long nlink_t;
+
+typedef long long loff_t;
+
+#define CPU_SETSIZE (sizeof(size_t)*8)
+
+typedef union
+{
+  char cpuset[CPU_SETSIZE/8];
+  size_t _align;
+} cpu_set_t;
+
+struct iovec {
+  void *iov_base;
+  size_t iov_len;
+};
+
+#define SHUT_RD SD_RECEIVE
+#define SHUT_WR SD_SEND
+#define SHUT_RDWR SD_BOTH
+
+#ifndef SIGINT
+#define SIGINT 2
+#endif
+
+#ifndef SIGKILL
+#define SIGKILL 9
+#endif
+
+#ifndef ENODATA
+// mingw doesn't define this, the Windows SDK does.
+#define ENODATA 120
+#endif
+
+#define ESHUTDOWN ECONNABORTED
+#define ESTALE 256
+#define EREMOTEIO 257
+
+#define IOV_MAX 1024
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+ssize_t readv(int fd, const struct iovec *iov, int iov_cnt);
+ssize_t writev(int fd, const struct iovec *iov, int iov_cnt);
+
+int fsync(int fd);
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+
+long int lrand48(void);
+
+int pipe(int pipefd[2]);
+
+int posix_memalign(void **memptr, size_t alignment, size_t size);
+
+char *strptime(const char *s, const char *format, struct tm *tm);
+
+int chown(const char *path, uid_t owner, gid_t group);
+int fchown(int fd, uid_t owner, gid_t group);
+int lchown(const char *path, uid_t owner, gid_t group);
+
+int win_socketpair(int socks[2]);
+
+#ifdef __cplusplus
+}
+#endif
+
+// Use "aligned_free" when freeing memory allocated using posix_memalign or
+// _aligned_malloc. Using "free" will crash.
+#define aligned_free(ptr) _aligned_free(ptr)
+
+// O_CLOEXEC is not defined on Windows. Since handles aren't inherited
+// with subprocesses unless explicitly requested, we'll define this
+// flag as a no-op.
+#define O_CLOEXEC 0
+#define SOCKOPT_VAL_TYPE char*
+
+#else /* WIN32 */
+
+#define SOCKOPT_VAL_TYPE void*
+
+#define aligned_free(ptr) free(ptr)
+
+#endif /* WIN32 */
+
+/* Supplies code to be run at startup time before invoking main().
+ * Use as:
+ *
+ *     CEPH_CONSTRUCTOR(my_constructor) {
+ *         ...some code...
+ *     }
+ */
+#ifdef _MSC_VER
+#pragma section(".CRT$XCU",read)
+#define CEPH_CONSTRUCTOR(f) \
+  static void __cdecl f(void); \
+  __declspec(allocate(".CRT$XCU")) static void (__cdecl*f##_)(void) = f; \
+  static void __cdecl f(void)
+#else
+#define CEPH_CONSTRUCTOR(f) \
+  static void f(void) __attribute__((constructor)); \
+  static void f(void)
+#endif
+
+/* This should only be used with the socket API. */
+static inline int ceph_sock_errno() {
+#ifdef _WIN32
+  return wsae_to_errno(WSAGetLastError());
+#else
+  return errno;
+#endif
+}
 
 #endif /* !CEPH_COMPAT_H */

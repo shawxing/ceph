@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/usr/bin/env bash
 #
 # Copyright (C) 2015 Red Hat <contact@redhat.com>
 # Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
@@ -18,7 +18,7 @@
 # Test that it works from sources with:
 #
 #  CEPH_ERASURE_CODE_BENCHMARK=src/ceph_erasure_code_benchmark  \
-#  PLUGIN_DIRECTORY=src/.libs \
+#  PLUGIN_DIRECTORY=build/lib \
 #      qa/workunits/erasure-code/bench.sh fplot jerasure |
 #      tee qa/workunits/erasure-code/bench.js
 #
@@ -38,7 +38,7 @@
 #
 #  TOTAL_SIZE=$((4 * 1024 * 1024 * 1024)) \
 #  CEPH_ERASURE_CODE_BENCHMARK=src/ceph_erasure_code_benchmark  \
-#  PLUGIN_DIRECTORY=src/.libs \
+#  PLUGIN_DIRECTORY=build/lib \
 #      qa/workunits/erasure-code/bench.sh fplot jerasure |
 #      tee qa/workunits/erasure-code/bench.js
 #
@@ -49,7 +49,7 @@ export PATH=/sbin:$PATH
 : ${VERBOSE:=false}
 : ${CEPH_ERASURE_CODE_BENCHMARK:=ceph_erasure_code_benchmark}
 : ${PLUGIN_DIRECTORY:=/usr/lib/ceph/erasure-code}
-: ${PLUGINS:=isa jerasure_generic jerasure_sse4}
+: ${PLUGINS:=isa jerasure}
 : ${TECHNIQUES:=vandermonde cauchy}
 : ${TOTAL_SIZE:=$((1024 * 1024))}
 : ${SIZE:=4096}
@@ -113,10 +113,8 @@ function bench_run() {
     k2ms[10]="3 4"
     local isa2technique_vandermonde='reed_sol_van'
     local isa2technique_cauchy='cauchy'
-    local jerasure_generic2technique_vandermonde='reed_sol_van'
-    local jerasure_generic2technique_cauchy='cauchy_good'
-    local jerasure_sse42technique_vandermonde='reed_sol_van'
-    local jerasure_sse42technique_cauchy='cauchy_good'
+    local jerasure2technique_vandermonde='reed_sol_van'
+    local jerasure2technique_cauchy='cauchy_good'
     for technique in ${TECHNIQUES} ; do
         for plugin in ${PLUGINS} ; do
             eval technique_parameter=\$${plugin}2technique_${technique}
@@ -188,7 +186,7 @@ fi
 # Local Variables:
 # compile-command: "\
 #   CEPH_ERASURE_CODE_BENCHMARK=../../../src/ceph_erasure_code_benchmark \
-#   PLUGIN_DIRECTORY=../../../src/.libs \
+#   PLUGIN_DIRECTORY=../../../build/lib \
 #   ./bench.sh
 # "
 # End:

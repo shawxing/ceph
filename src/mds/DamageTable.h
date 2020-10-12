@@ -16,8 +16,10 @@
 #ifndef DAMAGE_TABLE_H_
 #define DAMAGE_TABLE_H_
 
+#include <string_view>
+
 #include "mdstypes.h"
-#include "auth/Crypto.h"
+#include "include/random.h"
 
 class CDir;
 
@@ -34,159 +36,65 @@ typedef enum
 class DamageEntry
 {
   public:
-  damage_entry_id_t id;
-  utime_t reported_at;
+    DamageEntry()
+    {
+      id = ceph::util::generate_random_number<damage_entry_id_t>(0, 0xffffffff);
+      reported_at = ceph_clock_now();
+    }
 
-  DamageEntry()
-  {
-    id = get_random(0, 0xffffffff);
-    reported_at = ceph_clock_now(g_ceph_context);
-  }
+    virtual ~DamageEntry();
 
-  virtual damage_entry_type_t get_type() const = 0;
+    virtual damage_entry_type_t get_type() const = 0;
+    virtual void dump(Formatter *f) const = 0;
 
-  virtual ~DamageEntry();
+    damage_entry_id_t id;
+    utime_t reported_at;
 
-  virtual void dump(Formatter *f) const = 0;
+    // path is optional, advisory.  Used to give the admin an idea of what
+    // part of his tree the damage affects.
+    std::string path;
 };
 
-
-typedef ceph::shared_ptr<DamageEntry> DamageEntryRef;
-
-/**
- * Record damage to a particular dirfrag, implicitly affecting
- * any dentries within it.
- */
-class DirFragDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-  frag_t frag;
-
-  DirFragDamage(inodeno_t ino_, frag_t frag_)
-    : ino(ino_), frag(frag_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_DIRFRAG;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("dir_frag_damage");
-    f->dump_string("damage_type", "dir_frag");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->dump_stream("frag") << frag;
-    f->close_section();
-  }
-};
-
-
-/**
- * Record damage to a particular dname within a particular dirfrag
- */
-class DentryDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-  frag_t frag;
-  std::string dname;
-  snapid_t snap_id;
-
-  DentryDamage(
-      inodeno_t ino_,
-      frag_t frag_,
-      std::string dname_,
-      snapid_t snap_id_)
-    : ino(ino_), frag(frag_), dname(dname_), snap_id(snap_id_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_DENTRY;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("dentry_damage");
-    f->dump_string("damage_type", "dentry");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->dump_stream("frag") << frag;
-    f->dump_string("dname", dname);
-    f->dump_stream("snap_id") << snap_id;
-    f->close_section();
-  }
-};
-
-
-/**
- * Record damage to our ability to look up an ino by number
- */
-class BacktraceDamage : public DamageEntry
-{
-  public:
-  inodeno_t ino;
-
-  BacktraceDamage(inodeno_t ino_)
-    : ino(ino_)
-  {}
-
-  virtual damage_entry_type_t get_type() const
-  {
-    return DAMAGE_ENTRY_BACKTRACE;
-  }
-
-  void dump(Formatter *f) const
-  {
-    f->open_object_section("backtrace_damage");
-    f->dump_string("damage_type", "backtrace");
-    f->dump_int("id", id);
-    f->dump_int("ino", ino);
-    f->close_section();
-  }
-};
+typedef std::shared_ptr<DamageEntry> DamageEntryRef;
 
 class DirFragIdent
 {
   public:
-  inodeno_t ino;
-  frag_t frag;
+    DirFragIdent(inodeno_t ino_, frag_t frag_)
+      : ino(ino_), frag(frag_)
+    {}
 
-  bool operator<(const DirFragIdent &rhs) const
-  {
-    if (ino == rhs.ino) {
-      return frag < rhs.frag;
-    } else {
-      return ino < rhs.ino;
+    bool operator<(const DirFragIdent &rhs) const
+    {
+      if (ino == rhs.ino) {
+        return frag < rhs.frag;
+      } else {
+        return ino < rhs.ino;
+      }
     }
-  }
 
-  DirFragIdent(inodeno_t ino_, frag_t frag_)
-    : ino(ino_), frag(frag_)
-  {}
+    inodeno_t ino;
+    frag_t frag;
 };
 
 class DentryIdent
 {
   public:
-  std::string dname;
-  snapid_t snap_id;
+    DentryIdent(std::string_view dname_, snapid_t snap_id_)
+      : dname(dname_), snap_id(snap_id_)
+    {}
 
-  bool operator<(const DentryIdent &rhs) const
-  {
-    if (dname == rhs.dname) {
-      return snap_id < rhs.snap_id;
-    } else {
-      return dname < rhs.dname;
+    bool operator<(const DentryIdent &rhs) const
+    {
+      if (dname == rhs.dname) {
+        return snap_id < rhs.snap_id;
+      } else {
+        return dname < rhs.dname;
+      }
     }
-  }
 
-  DentryIdent(const std::string &dname_, snapid_t snap_id_)
-    : dname(dname_), snap_id(snap_id_)
-  {}
+    std::string dname;
+    snapid_t snap_id;
 };
 
 /**
@@ -211,86 +119,78 @@ class DentryIdent
  */
 class DamageTable
 {
-protected:
+  public:
+    explicit DamageTable(const mds_rank_t rank_)
+      : rank(rank_)
+    {
+      ceph_assert(rank_ != MDS_RANK_NONE);
+    }
 
-  // Map of all dirfrags reported damaged
-  std::map<DirFragIdent, DamageEntryRef> dirfrags;
+    /**
+     * Return true if no damage entries exist
+     */
+    bool empty() const
+    {
+      return by_id.empty();
+    }
 
-  // Store dentries in a map per dirfrag, so that we can
-  // readily look up all the bad dentries in a particular
-  // dirfrag
-  std::map<DirFragIdent, std::map<DentryIdent, DamageEntryRef> > dentries;
+    /**
+     * Indicate that a dirfrag cannot be loaded.
+     *
+     * @return true if fatal
+     */
+    bool notify_dirfrag(inodeno_t ino, frag_t frag, std::string_view path);
 
-  // Map of all inodes which could not be resolved remotely
-  // (i.e. have probably/possibly missing backtraces)
-  std::map<inodeno_t, DamageEntryRef> remotes;
+    /**
+     * Indicate that a particular dentry cannot be loaded.
+     *
+     * @return true if fatal
+     */
+    bool notify_dentry(
+      inodeno_t ino, frag_t frag,
+      snapid_t snap_id, std::string_view dname, std::string_view path);
 
-  // All damage, by ID.  This is a secondary index
-  // to the dirfrag, dentry, remote maps.  It exists
-  // to enable external tools to unambiguously operate
-  // on particular entries.
-  std::map<damage_entry_id_t, DamageEntryRef> by_id;
+    /**
+     * Indicate that a particular Inode could not be loaded by number
+     */
+    bool notify_remote_damaged(inodeno_t ino, std::string_view path);
 
-  // I need to know my MDS rank so that I can check if
-  // metadata items are part of my mydir.
-  const mds_rank_t rank;
-
-  bool oversized() const;
-
-public:
-
-  /**
-   * Return true if no damage entries exist
-   */
-  bool empty() const
-  {
-    return by_id.empty();
-  }
-
-  /**
-   * Indicate that a dirfrag cannot be loaded.
-   *
-   * @return true if fatal
-   */
-  bool notify_dirfrag(inodeno_t ino, frag_t frag);
-
-  /**
-   * Indicate that a particular dentry cannot be loaded.
-   *
-   * @return true if fatal
-   */
-  bool notify_dentry(
-    inodeno_t ino, frag_t frag,
-    snapid_t snap_id, const std::string &dname);
-
-  /**
-   * Indicate that a particular Inode could not be loaded by number
-   */
-  bool notify_remote_damaged(
-      inodeno_t ino);
-
-  bool is_dentry_damaged(
+    bool is_dentry_damaged(
       const CDir *dir_frag,
-      const std::string &dname,
+      std::string_view dname,
       const snapid_t snap_id) const;
 
-  bool is_dirfrag_damaged(
-      const CDir *dir_frag) const;
+    bool is_dirfrag_damaged(const CDir *dir_frag) const;
 
-  bool is_remote_damaged(
-      const inodeno_t ino) const;
+    bool is_remote_damaged(const inodeno_t ino) const;
 
+    void dump(Formatter *f) const;
 
-  DamageTable(const mds_rank_t rank_)
-    : rank(rank_)
-  {
-    assert(rank_ != MDS_RANK_NONE);
-  }
+    void erase(damage_entry_id_t damage_id);
 
-  void dump(Formatter *f) const;
+  protected:
+    // I need to know my MDS rank so that I can check if
+    // metadata items are part of my mydir.
+    const mds_rank_t rank;
 
-  void erase(damage_entry_id_t damage_id);
+    bool oversized() const;
+
+    // Map of all dirfrags reported damaged
+    std::map<DirFragIdent, DamageEntryRef> dirfrags;
+
+    // Store dentries in a map per dirfrag, so that we can
+    // readily look up all the bad dentries in a particular
+    // dirfrag
+    std::map<DirFragIdent, std::map<DentryIdent, DamageEntryRef> > dentries;
+
+    // Map of all inodes which could not be resolved remotely
+    // (i.e. have probably/possibly missing backtraces)
+    std::map<inodeno_t, DamageEntryRef> remotes;
+
+    // All damage, by ID.  This is a secondary index
+    // to the dirfrag, dentry, remote maps.  It exists
+    // to enable external tools to unambiguously operate
+    // on particular entries.
+    std::map<damage_entry_id_t, DamageEntryRef> by_id;
 };
-
 #endif // DAMAGE_TABLE_H_
-

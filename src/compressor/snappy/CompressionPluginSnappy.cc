@@ -14,29 +14,10 @@
 
 
 // -----------------------------------------------------------------------------
+#include "acconfig.h"
 #include "ceph_ver.h"
-#include "compressor/CompressionPlugin.h"
-#include "SnappyCompressor.h"
-// -----------------------------------------------------------------------------
-
-class CompressionPluginSnappy : public CompressionPlugin {
-
-public:
-
-  explicit CompressionPluginSnappy(CephContext* cct) : CompressionPlugin(cct)
-  {}
-
-  virtual int factory(CompressorRef *cs,
-                      ostream *ss)
-  {
-    if (compressor == 0) {
-      SnappyCompressor *interface = new SnappyCompressor();
-      compressor = CompressorRef(interface);
-    }
-    *cs = compressor;
-    return 0;
-  }
-};
+#include "common/ceph_context.h"
+#include "CompressionPluginSnappy.h"
 
 // -----------------------------------------------------------------------------
 
@@ -51,7 +32,7 @@ int __ceph_plugin_init(CephContext *cct,
                        const std::string& type,
                        const std::string& name)
 {
-  PluginRegistry *instance = cct->get_plugin_registry();
+  auto instance = cct->get_plugin_registry();
 
   return instance->add(type, name, new CompressionPluginSnappy(cct));
 }

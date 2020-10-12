@@ -5,15 +5,21 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/ExclusiveLock.h"
 
+#define dout_subsys ceph_subsys_rbd
+#undef dout_prefix
+#define dout_prefix *_dout << "librbd::ExclusiveLock::StandardPolicy "
+
 namespace librbd {
 namespace exclusive_lock {
 
-void StandardPolicy::lock_requested(bool force) {
-  assert(m_image_ctx->owner_lock.is_locked());
-  assert(m_image_ctx->exclusive_lock != nullptr);
+int StandardPolicy::lock_requested(bool force) {
+  ceph_assert(ceph_mutex_is_locked(m_image_ctx->owner_lock));
+  ceph_assert(m_image_ctx->exclusive_lock != nullptr);
 
-  // release the lock upon request (ignore forced requests)
-  m_image_ctx->exclusive_lock->release_lock(nullptr);
+  ldout(m_image_ctx->cct, 20) << this << " " << __func__ << ": force=" << force
+			      << dendl;
+
+  return -EROFS;
 }
 
 } // namespace exclusive_lock

@@ -29,25 +29,25 @@
 
 class CompressorExample : public Compressor {
 public:
-  virtual ~CompressorExample() {}
+  CompressorExample() : Compressor(COMP_ALG_NONE, "example") {}
+  ~CompressorExample() override {}
 
-  virtual int compress(const bufferlist &in, bufferlist &out)
+  int compress(const bufferlist &in, bufferlist &out, boost::optional<int32_t> &compressor_message) override
   {
     out = in;
     return 0;
   }
 
-  virtual int decompress(const bufferlist &in, bufferlist &out)
+  int decompress(const bufferlist &in, bufferlist &out, boost::optional<int32_t> compressor_message) override
   {
     out = in;
     return 0;
   }
-
-  virtual const char* get_method_name()
+  int decompress(bufferlist::const_iterator &p, size_t compressed_len, bufferlist &out, boost::optional<int32_t> compressor_message) override
   {
-    return "example";
+    p.copy(std::min<size_t>(p.get_remaining(), compressed_len), out);
+    return 0;
   }
-
 };
 
 #endif

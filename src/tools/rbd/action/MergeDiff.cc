@@ -15,6 +15,7 @@
 #include <iostream>
 #include <boost/program_options.hpp>
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd
 
 namespace rbd {
@@ -47,17 +48,17 @@ static int parse_diff_header(int fd, __u8 *tag, string *from, string *to, uint64
     if (r < 0)
       return r;
 
-    if (*tag == 'f') {
+    if (*tag == RBD_DIFF_FROM_SNAP) {
       r = utils::read_string(fd, 4096, from);   // 4k limit to make sure we don't get a garbage string
       if (r < 0)
         return r;
       dout(2) << " from snap " << *from << dendl;
-    } else if (*tag == 't') {
+    } else if (*tag == RBD_DIFF_TO_SNAP) {
       r = utils::read_string(fd, 4096, to);   // 4k limit to make sure we don't get a garbage string
       if (r < 0)
         return r;
       dout(2) << " to snap " << *to << dendl;
-    } else if (*tag == 's') {
+    } else if (*tag == RBD_DIFF_IMAGE_SIZE) {
       char buf[8];
       r = safe_read_exact(fd, buf, 8);
       if (r < 0)
@@ -65,8 +66,8 @@ static int parse_diff_header(int fd, __u8 *tag, string *from, string *to, uint64
 
       bufferlist bl;
       bl.append(buf, 8);
-      bufferlist::iterator p = bl.begin();
-      ::decode(*size, p);
+      auto p = bl.cbegin();
+      decode(*size, p);
     } else {
       break;
     }
@@ -85,13 +86,13 @@ static int parse_diff_body(int fd, __u8 *tag, uint64_t *offset, uint64_t *length
       return r;
   }
 
-  if (*tag == 'e') {
+  if (*tag == RBD_DIFF_END) {
     offset = 0;
     length = 0;
     return 0;
   }
 
-  if (*tag != 'w' && *tag != 'z')
+  if (*tag != RBD_DIFF_WRITE && *tag != RBD_DIFF_ZERO)
     return -ENOTSUP;
 
   char buf[16];
@@ -101,9 +102,9 @@ static int parse_diff_body(int fd, __u8 *tag, uint64_t *offset, uint64_t *length
 
   bufferlist bl;
   bl.append(buf, 16);
-  bufferlist::iterator p = bl.begin();
-  ::decode(*offset, p);
-  ::decode(*length, p);
+  auto p = bl.cbegin();
+  decode(*offset, p);
+  decode(*length, p);
 
   if (!(*length))
     return -ENOTSUP;
@@ -117,19 +118,19 @@ static int parse_diff_body(int fd, __u8 *tag, uint64_t *offset, uint64_t *length
  */
 static int accept_diff_body(int fd, int pd, __u8 tag, uint64_t offset, uint64_t length)
 {
-  if (tag == 'e')
+  if (tag == RBD_DIFF_END)
     return 0;
 
   bufferlist bl;
-  ::encode(tag, bl);
-  ::encode(offset, bl);
-  ::encode(length, bl);
+  encode(tag, bl);
+  encode(offset, bl);
+  encode(length, bl);
   int r;
   r = bl.write_fd(pd);
   if (r < 0)
     return r;
 
-  if (tag == 'w') {
+  if (tag == RBD_DIFF_WRITE) {
     bufferptr bp = buffer::create(length);
     r = safe_read_exact(fd, bp.c_str(), length);
     if (r < 0)
@@ -159,7 +160,9 @@ static int do_merge_diff(const char *first, const char *second,
 
   string f_from, f_to;
   string s_from, s_to;
-  uint64_t f_size, s_size, pc_size;
+  uint64_t f_size = 0;
+  uint64_t s_size = 0;
+  uint64_t pc_size;
 
   __u8 f_tag = 0, s_tag = 0;
   uint64_t f_off = 0, f_len = 0;
@@ -168,7 +171,7 @@ static int do_merge_diff(const char *first, const char *second,
 
   bool first_stdin = !strcmp(first, "-");
   if (first_stdin) {
-    fd = 0;
+    fd = STDIN_FILENO;
   } else {
     fd = open(first, O_RDONLY);
     if (fd < 0) {
@@ -198,7 +201,6 @@ static int do_merge_diff(const char *first, const char *second,
 
   //We just handle the case like 'banner, [ftag], [ttag], stag, [wztag]*,etag',
   // and the (offset,length) in wztag must be ascending order.
-
   r = parse_diff_header(fd, &f_tag, &f_from, &f_to, &f_size);
   if (r < 0) {
     std::cerr << "rbd: failed to parse first diff header" << std::endl;
@@ -225,20 +227,20 @@ static int do_merge_diff(const char *first, const char *second,
 
     __u8 tag;
     if (f_from.size()) {
-      tag = 'f';
-      ::encode(tag, bl);
-      ::encode(f_from, bl);
+      tag = RBD_DIFF_FROM_SNAP;
+      encode(tag, bl);
+      encode(f_from, bl);
     }
 
     if (s_to.size()) {
-      tag = 't';
-      ::encode(tag, bl);
-      ::encode(s_to, bl);
+      tag = RBD_DIFF_TO_SNAP;
+      encode(tag, bl);
+      encode(s_to, bl);
     }
 
-    tag = 's';
-    ::encode(tag, bl);
-    ::encode(s_size, bl);
+    tag = RBD_DIFF_IMAGE_SIZE;
+    encode(tag, bl);
+    encode(s_size, bl);
 
     r = bl.write_fd(pd);
     if (r < 0) {
@@ -269,9 +271,9 @@ static int do_merge_diff(const char *first, const char *second,
         goto done;
       }
 
-      if (f_tag == 'e') {
+      if (f_tag == RBD_DIFF_END) {
         f_end = true;
-        f_tag = 'z';
+        f_tag = RBD_DIFF_ZERO;
         f_off = f_size;
         if (f_size < s_size)
           f_len = s_size - f_size;
@@ -300,7 +302,7 @@ static int do_merge_diff(const char *first, const char *second,
         goto done;
       }
 
-      if (s_tag == 'e') {
+      if (s_tag == RBD_DIFF_END) {
         s_end = true;
         s_off = s_size;
         if (s_size < f_size)
@@ -322,6 +324,10 @@ static int do_merge_diff(const char *first, const char *second,
       if (delta > f_len)
         delta = f_len;
       r = accept_diff_body(fd, pd, f_tag, f_off, delta);
+      if (r < 0) {
+        std::cerr << "rbd: failed to merge diff chunk" << std::endl;
+        goto done;
+      }
       f_off += delta;
       f_len -= delta;
 
@@ -330,13 +336,13 @@ static int do_merge_diff(const char *first, const char *second,
         continue;
       }
     }
-    assert(f_off >= s_off);
+    ceph_assert(f_off >= s_off);
 
     if (f_off < s_off + s_len && f_len) {
       uint64_t delta = s_off + s_len - f_off;
       if (delta > f_len)
         delta = f_len;
-      if (f_tag == 'w') {
+      if (f_tag == RBD_DIFF_WRITE) {
         if (first_stdin) {
           bufferptr bp = buffer::create(delta);
           r = safe_read_exact(fd, bp.c_str(), delta);
@@ -357,28 +363,33 @@ static int do_merge_diff(const char *first, const char *second,
         continue;
       }
     }
-    assert(f_off >= s_off + s_len);
+    ceph_assert(f_off >= s_off + s_len);
     if (s_len) {
       r = accept_diff_body(sd, pd, s_tag, s_off, s_len);
+      if (r < 0) {
+        std::cerr << "rbd: failed to merge diff chunk" << std::endl;
+        goto done;
+      }
       s_off += s_len;
       s_len = 0;
       s_tag = 0;
-    } else
-      assert(f_end && s_end);
+    } else {
+      ceph_assert(f_end && s_end);
+    }
     continue;
   }
 
   {//tail
-    __u8 tag = 'e';
+    __u8 tag = RBD_DIFF_END;
     bufferlist bl;
-    ::encode(tag, bl);
+    encode(tag, bl);
     r = bl.write_fd(pd);
   }
 
 done:
   if (pd > 2)
     close(pd);
-  if (sd)
+  if (sd > 2)
     close(sd);
   if (fd > 2)
     close(fd);
@@ -403,7 +414,8 @@ void get_arguments(po::options_description *positional,
   at::add_no_progress_option(options);
 }
 
-int execute(const po::variables_map &vm) {
+int execute(const po::variables_map &vm,
+            const std::vector<std::string> &ceph_global_init_args) {
   std::string first_diff = utils::get_positional_argument(vm, 0);
   if (first_diff.empty()) {
     std::cerr << "rbd: first diff was not specified" << std::endl;
@@ -417,8 +429,8 @@ int execute(const po::variables_map &vm) {
   }
 
   std::string path;
-  int r = utils::get_path(vm, utils::get_positional_argument(vm, 2),
-                          &path);
+  size_t arg_index = 2;
+  int r = utils::get_path(vm, &arg_index, &path);
   if (r < 0) {
     return r;
   }

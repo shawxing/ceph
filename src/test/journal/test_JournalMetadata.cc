@@ -4,12 +4,11 @@
 #include "journal/JournalMetadata.h"
 #include "test/journal/RadosTestFixture.h"
 #include "common/Cond.h"
-#include "common/Mutex.h"
 #include <map>
 
 class TestJournalMetadata : public RadosTestFixture {
 public:
-  virtual void TearDown() {
+  void TearDown() override {
     for (MetadataList::iterator it = m_metadata_list.begin();
          it != m_metadata_list.end(); ++it) {
       (*it)->remove_listener(&m_listener);
@@ -19,24 +18,25 @@ public:
     RadosTestFixture::TearDown();
   }
 
-  journal::JournalMetadataPtr create_metadata(const std::string &oid,
-                                              const std::string &client_id,
-                                              double commit_internal = 0.1) {
-    journal::JournalMetadataPtr metadata = RadosTestFixture::create_metadata(
-      oid, client_id, commit_internal);
+  auto create_metadata(const std::string &oid,
+                       const std::string &client_id,
+                       double commit_interval = 0.1,
+                       int max_concurrent_object_sets = 0) {
+    auto metadata = RadosTestFixture::create_metadata(
+      oid, client_id, commit_interval, max_concurrent_object_sets);
     m_metadata_list.push_back(metadata);
     metadata->add_listener(&m_listener);
     return metadata;
   }
 
-  typedef std::list<journal::JournalMetadataPtr> MetadataList;
+  typedef std::list<ceph::ref_t<journal::JournalMetadata>> MetadataList;
   MetadataList m_metadata_list;
 };
 
 TEST_F(TestJournalMetadata, JournalDNE) {
   std::string oid = get_temp_oid();
 
-  journal::JournalMetadataPtr metadata1 = create_metadata(oid, "client1");
+  auto metadata1 = create_metadata(oid, "client1");
   ASSERT_EQ(-ENOENT, init_metadata(metadata1));
 }
 
@@ -46,10 +46,10 @@ TEST_F(TestJournalMetadata, ClientDNE) {
   ASSERT_EQ(0, create(oid, 14, 2));
   ASSERT_EQ(0, client_register(oid, "client1", ""));
 
-  journal::JournalMetadataPtr metadata1 = create_metadata(oid, "client1");
+  auto metadata1 = create_metadata(oid, "client1");
   ASSERT_EQ(0, init_metadata(metadata1));
 
-  journal::JournalMetadataPtr metadata2 = create_metadata(oid, "client2");
+  auto metadata2 = create_metadata(oid, "client2");
   ASSERT_EQ(-ENOENT, init_metadata(metadata2));
 }
 
@@ -59,10 +59,10 @@ TEST_F(TestJournalMetadata, Committed) {
   ASSERT_EQ(0, create(oid, 14, 2));
   ASSERT_EQ(0, client_register(oid, "client1", ""));
 
-  journal::JournalMetadataPtr metadata1 = create_metadata(oid, "client1", 600);
+  auto metadata1 = create_metadata(oid, "client1", 600);
   ASSERT_EQ(0, init_metadata(metadata1));
 
-  journal::JournalMetadataPtr metadata2 = create_metadata(oid, "client1");
+  auto metadata2 = create_metadata(oid, "client1");
   ASSERT_EQ(0, init_metadata(metadata2));
   ASSERT_TRUE(wait_for_update(metadata2));
 
@@ -104,7 +104,7 @@ TEST_F(TestJournalMetadata, UpdateActiveObject) {
   ASSERT_EQ(0, create(oid, 14, 2));
   ASSERT_EQ(0, client_register(oid, "client1", ""));
 
-  journal::JournalMetadataPtr metadata1 = create_metadata(oid, "client1");
+  auto metadata1 = create_metadata(oid, "client1");
   ASSERT_EQ(0, init_metadata(metadata1));
   ASSERT_TRUE(wait_for_update(metadata1));
 
@@ -116,13 +116,77 @@ TEST_F(TestJournalMetadata, UpdateActiveObject) {
   ASSERT_EQ(123U, metadata1->get_active_set());
 }
 
+TEST_F(TestJournalMetadata, DisconnectLaggyClient) {
+  std::string oid = get_temp_oid();
+
+  ASSERT_EQ(0, create(oid));
+  ASSERT_EQ(0, client_register(oid, "client1", ""));
+  ASSERT_EQ(0, client_register(oid, "client2", "laggy"));
+
+  int max_concurrent_object_sets = 100;
+  auto metadata =
+    create_metadata(oid, "client1", 0.1, max_concurrent_object_sets);
+  ASSERT_EQ(0, init_metadata(metadata));
+  ASSERT_TRUE(wait_for_update(metadata));
+
+  ASSERT_EQ(0U, metadata->get_active_set());
+
+  journal::JournalMetadata::RegisteredClients clients;
+
+#define ASSERT_CLIENT_STATES(s1, s2)	\
+  ASSERT_EQ(2U, clients.size());	\
+  for (auto &c : clients) {		\
+    if (c.id == "client1") {		\
+      ASSERT_EQ(c.state, s1);		\
+    } else if (c.id == "client2") {	\
+      ASSERT_EQ(c.state, s2);		\
+    } else {				\
+      ASSERT_TRUE(false);		\
+    }					\
+  }
+
+  metadata->get_registered_clients(&clients);
+  ASSERT_CLIENT_STATES(cls::journal::CLIENT_STATE_CONNECTED,
+		       cls::journal::CLIENT_STATE_CONNECTED);
+
+  // client2 is connected when active set <= max_concurrent_object_sets
+  ASSERT_EQ(0, metadata->set_active_set(max_concurrent_object_sets));
+  ASSERT_TRUE(wait_for_update(metadata));
+  uint64_t commit_tid = metadata->allocate_commit_tid(0, 0, 0);
+  C_SaferCond cond1;
+  metadata->committed(commit_tid, [&cond1]() { return &cond1; });
+  ASSERT_EQ(0, cond1.wait());
+  metadata->flush_commit_position();
+  ASSERT_TRUE(wait_for_update(metadata));
+  ASSERT_EQ(100U, metadata->get_active_set());
+  clients.clear();
+  metadata->get_registered_clients(&clients);
+  ASSERT_CLIENT_STATES(cls::journal::CLIENT_STATE_CONNECTED,
+		       cls::journal::CLIENT_STATE_CONNECTED);
+
+  // client2 is disconnected when active set > max_concurrent_object_sets
+  ASSERT_EQ(0, metadata->set_active_set(max_concurrent_object_sets + 1));
+  ASSERT_TRUE(wait_for_update(metadata));
+  commit_tid = metadata->allocate_commit_tid(0, 0, 1);
+  C_SaferCond cond2;
+  metadata->committed(commit_tid, [&cond2]() { return &cond2; });
+  ASSERT_EQ(0, cond2.wait());
+  metadata->flush_commit_position();
+  ASSERT_TRUE(wait_for_update(metadata));
+  ASSERT_EQ(101U, metadata->get_active_set());
+  clients.clear();
+  metadata->get_registered_clients(&clients);
+  ASSERT_CLIENT_STATES(cls::journal::CLIENT_STATE_CONNECTED,
+		       cls::journal::CLIENT_STATE_DISCONNECTED);
+}
+
 TEST_F(TestJournalMetadata, AssertActiveTag) {
   std::string oid = get_temp_oid();
 
   ASSERT_EQ(0, create(oid));
   ASSERT_EQ(0, client_register(oid, "client1", ""));
 
-  journal::JournalMetadataPtr metadata = create_metadata(oid, "client1");
+  auto metadata = create_metadata(oid, "client1");
   ASSERT_EQ(0, init_metadata(metadata));
   ASSERT_TRUE(wait_for_update(metadata));
 

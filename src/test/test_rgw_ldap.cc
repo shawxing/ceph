@@ -25,7 +25,6 @@
 #include "gtest/gtest.h"
 #include "common/ceph_argparse.h"
 #include "common/debug.h"
-#include "global/global_init.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -43,10 +42,13 @@ namespace {
 
   string ldap_uri = "ldaps://f23-kdc.rgw.com";
   string ldap_binddn = "uid=admin,cn=users,cn=accounts,dc=rgw,dc=com";
+  string ldap_bindpw = "supersecret";
   string ldap_searchdn = "cn=users,cn=accounts,dc=rgw,dc=com";
+  string ldap_searchfilter = "";
   string ldap_dnattr = "uid";
 
-  rgw::LDAPHelper ldh(ldap_uri, ldap_binddn, ldap_searchdn, ldap_dnattr);
+  rgw::LDAPHelper ldh(ldap_uri, ldap_binddn, ldap_bindpw, ldap_searchdn,
+		      ldap_searchfilter, ldap_dnattr);
 
 } /* namespace */
 
@@ -100,7 +102,7 @@ int main(int argc, char *argv[])
     }
   }
 
-  /* dont accidentally run as anonymous */
+  /* don't accidentally run as anonymous */
   if (access_key == "") {
     std::cout << argv[0] << " no AWS credentials, exiting" << std::endl;
     return EPERM;

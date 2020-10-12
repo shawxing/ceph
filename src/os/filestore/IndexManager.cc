@@ -12,7 +12,6 @@
  *
  */
 
-#include "include/memory.h"
 #include "include/unordered_map.h"
 
 #if defined(__FreeBSD__)
@@ -21,7 +20,6 @@
 
 #include <errno.h>
 
-#include "common/Mutex.h"
 #include "common/Cond.h"
 #include "common/config.h"
 #include "common/debug.h"
@@ -33,9 +31,16 @@
 
 #include "chain_xattr.h"
 
+using std::string;
+
+using ceph::bufferlist;
+using ceph::bufferptr;
+using ceph::decode;
+using ceph::encode;
+
 static int set_version(const char *path, uint32_t version) {
   bufferlist bl;
-  ::encode(version, bl);
+  encode(version, bl);
   return chain_setxattr<true, true>(
     path, "user.cephos.collection_version", bl.c_str(),
     bl.length());
@@ -56,8 +61,8 @@ static int get_version(const char *path, uint32_t *version) {
   bp.set_length(r);
   bufferlist bl;
   bl.push_back(bp);
-  bufferlist::iterator i = bl.begin();
-  ::decode(*version, i);
+  auto i = bl.cbegin();
+  decode(*version, i);
   return 0;
 }
 
@@ -74,15 +79,18 @@ IndexManager::~IndexManager() {
 
 
 int IndexManager::init_index(coll_t c, const char *path, uint32_t version) {
-  RWLock::WLocker l(lock);
+  std::unique_lock l{lock};
   int r = set_version(path, version);
   if (r < 0)
     return r;
-  HashIndex index(c, path, g_conf->filestore_merge_threshold,
-		  g_conf->filestore_split_multiple,
+  HashIndex index(cct, c, path, cct->_conf->filestore_merge_threshold,
+		  cct->_conf->filestore_split_multiple,
 		  version,
-		  g_conf->filestore_index_retry_probability);
-  return index.init();
+		  cct->_conf->filestore_index_retry_probability);
+  r = index.init();
+  if (r < 0)
+    return r;
+  return index.read_settings();
 }
 
 int IndexManager::build_index(coll_t c, const char *path, CollectionIndex **index) {
@@ -100,25 +108,27 @@ int IndexManager::build_index(coll_t c, const char *path, CollectionIndex **inde
     case CollectionIndex::HASH_INDEX_TAG_2: // fall through
     case CollectionIndex::HOBJECT_WITH_POOL: {
       // Must be a HashIndex
-      *index = new HashIndex(c, path, g_conf->filestore_merge_threshold,
-				   g_conf->filestore_split_multiple, version);
-      return 0;
+      *index = new HashIndex(cct, c, path,
+			     cct->_conf->filestore_merge_threshold,
+			     cct->_conf->filestore_split_multiple,
+			     version);
+      return (*index)->read_settings();
     }
-    default: assert(0);
+    default: ceph_abort();
     }
 
   } else {
     // No need to check
-    *index = new HashIndex(c, path, g_conf->filestore_merge_threshold,
-				 g_conf->filestore_split_multiple,
-				 CollectionIndex::HOBJECT_WITH_POOL,
-				 g_conf->filestore_index_retry_probability);
-    return 0;
+    *index = new HashIndex(cct, c, path, cct->_conf->filestore_merge_threshold,
+			   cct->_conf->filestore_split_multiple,
+			   CollectionIndex::HOBJECT_WITH_POOL,
+			   cct->_conf->filestore_index_retry_probability);
+    return (*index)->read_settings();
   }
 }
 
 bool IndexManager::get_index_optimistic(coll_t c, Index *index) {
-  RWLock::RLocker l(lock);
+  std::shared_lock l{lock};
   ceph::unordered_map<coll_t, CollectionIndex* > ::iterator it = col_indices.find(c);
   if (it == col_indices.end()) 
     return false;
@@ -129,7 +139,7 @@ bool IndexManager::get_index_optimistic(coll_t c, Index *index) {
 int IndexManager::get_index(coll_t c, const string& baseDir, Index *index) {
   if (get_index_optimistic(c, index))
     return 0;
-  RWLock::WLocker l(lock);
+  std::unique_lock l{lock};
   ceph::unordered_map<coll_t, CollectionIndex* > ::iterator it = col_indices.find(c);
   if (it == col_indices.end()) {
     char path[PATH_MAX];

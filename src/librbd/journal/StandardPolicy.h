@@ -12,19 +12,27 @@ struct ImageCtx;
 
 namespace journal {
 
+template<typename ImageCtxT = ImageCtx>
 class StandardPolicy : public Policy {
 public:
-  StandardPolicy(ImageCtx *image_ctx) : m_image_ctx(image_ctx) {
+  StandardPolicy(ImageCtxT *image_ctx) : m_image_ctx(image_ctx) {
   }
 
-  virtual void allocate_tag_on_lock(Context *on_finish);
-  virtual void cancel_external_replay(Context *on_finish);
+  bool append_disabled() const override {
+    return false;
+  }
+  bool journal_disabled() const override {
+    return false;
+  }
+  void allocate_tag_on_lock(Context *on_finish) override;
 
 private:
-  ImageCtx *m_image_ctx;
+  ImageCtxT *m_image_ctx;
 };
 
 } // namespace journal
 } // namespace librbd
+
+extern template class librbd::journal::StandardPolicy<librbd::ImageCtx>;
 
 #endif // CEPH_LIBRBD_JOURNAL_STANDARD_POLICY_H

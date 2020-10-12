@@ -63,7 +63,7 @@ public:
   }
 
   void issued_io(IO::ptr io, std::set<IO::ptr> *latest_ios) {
-    assert(io);
+    ceph_assert(io);
     if (m_latest_io.get() != NULL) {
       latest_ios->erase(m_latest_io);
     }
@@ -88,8 +88,8 @@ private:
 
 class AnonymizedImage {
 public:
-  void init(string image_name, int index) {
-    assert(m_image_name == "");
+  void init(const string &image_name, int index) {
+    ceph_assert(m_image_name == "");
     m_image_name = image_name;
     ostringstream oss;
     oss << "image" << index;
@@ -119,14 +119,14 @@ private:
   map<string, string> m_snaps;
 };
 
-static void usage(string prog) {
+static void usage(const string &prog) {
   std::stringstream str;
   str << "Usage: " << prog << " ";
   std::cout << str.str() << "[ --window <seconds> ] [ --anonymize ] [ --verbose ]" << std::endl
             << std::string(str.str().size(), ' ') << "<trace-input> <replay-output>" << endl;
 }
 
-__attribute__((noreturn)) static void usage_exit(string prog, string msg) {
+__attribute__((noreturn)) static void usage_exit(const string &prog, const string &msg) {
   cerr << msg << endl;
   usage(prog);
   exit(1);
@@ -194,7 +194,7 @@ public:
     struct bt_ctf_iter *itr = bt_ctf_iter_create(ctx,
 						 NULL, // begin_pos
 						 NULL); // end_pos
-    assert(itr);
+    ceph_assert(itr);
 
     struct bt_iter *bt_itr = bt_ctf_get_iter(itr);
 
@@ -358,7 +358,7 @@ private:
     } else if (strcmp(event_name, "librbd:open_image_exit") == 0) {
       completed(thread->latest_io());
       boost::shared_ptr<OpenImageIO> io(boost::dynamic_pointer_cast<OpenImageIO>(thread->latest_io()));
-      assert(io);
+      ceph_assert(io);
       m_open_images.insert(io->imagectx());
     } else if (strcmp(event_name, "librbd:close_image_enter") == 0) {
       imagectx_id_t imagectx = fields.uint64("imagectx");
@@ -370,7 +370,7 @@ private:
     } else if (strcmp(event_name, "librbd:close_image_exit") == 0) {
       completed(thread->latest_io());
       boost::shared_ptr<CloseImageIO> io(boost::dynamic_pointer_cast<CloseImageIO>(thread->latest_io()));
-      assert(io);
+      ceph_assert(io);
       m_open_images.erase(io->imagectx());
     } else if (strcmp(event_name, "librbd:aio_open_image_enter") == 0) {
       string name(fields.string("name"));
@@ -427,6 +427,21 @@ private:
       ios->push_back(io);
     } else if (strcmp(event_name, "librbd:write_exit") == 0) {
       completed(thread->latest_io());
+    } else if (strcmp(event_name, "librbd:discard_enter") == 0) {
+      string name(fields.string("name"));
+      string snap_name(fields.string("snap_name"));
+      bool readonly = fields.int64("read_only");
+      uint64_t offset = fields.uint64("off");
+      uint64_t length = fields.uint64("len");
+      imagectx_id_t imagectx = fields.uint64("imagectx");
+      require_image(ts, thread, imagectx, name, snap_name, readonly, ios);
+      action_id_t ionum = next_id();
+      IO::ptr io(new DiscardIO(ionum, ts, threadID, m_recent_completions,
+                                imagectx, offset, length));
+      thread->issued_io(io, &m_latest_ios);
+      ios->push_back(io);
+    } else if (strcmp(event_name, "librbd:discard_exit") == 0) {
+      completed(thread->latest_io());
     } else if (strcmp(event_name, "librbd:aio_read_enter") == 0 ||
                strcmp(event_name, "librbd:aio_read2_enter") == 0) {
       string name(fields.string("name"));
@@ -455,6 +470,21 @@ private:
       require_image(ts, thread, imagectx, name, snap_name, readonly, ios);
       action_id_t ionum = next_id();
       IO::ptr io(new AioWriteIO(ionum, ts, threadID, m_recent_completions,
+                                imagectx, offset, length));
+      thread->issued_io(io, &m_latest_ios);
+      ios->push_back(io);
+      m_pending_ios[completion] = io;
+    } else if (strcmp(event_name, "librbd:aio_discard_enter") == 0) {
+      string name(fields.string("name"));
+      string snap_name(fields.string("snap_name"));
+      bool readonly = fields.int64("read_only");
+      uint64_t offset = fields.uint64("off");
+      uint64_t length = fields.uint64("len");
+      uint64_t completion = fields.uint64("completion");
+      imagectx_id_t imagectx = fields.uint64("imagectx");
+      require_image(ts, thread, imagectx, name, snap_name, readonly, ios);
+      action_id_t ionum = next_id();
+      IO::ptr io(new AioDiscardIO(ionum, ts, threadID, m_recent_completions,
                                 imagectx, offset, length));
       thread->issued_io(io, &m_latest_ios);
       ios->push_back(io);
@@ -511,7 +541,7 @@ private:
 		     const string& snap_name,
 		     bool readonly,
                      IO::ptrs *ios) {
-    assert(thread);
+    ceph_assert(thread);
     if (m_open_images.count(imagectx) > 0) {
       return;
     }

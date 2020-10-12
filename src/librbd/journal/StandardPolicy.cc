@@ -2,9 +2,9 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/journal/StandardPolicy.h"
-#include "common/WorkQueue.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Journal.h"
+#include "librbd/asio/ContextWQ.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -13,8 +13,9 @@
 namespace librbd {
 namespace journal {
 
-void StandardPolicy::allocate_tag_on_lock(Context *on_finish) {
-  assert(m_image_ctx->journal != nullptr);
+template<typename I>
+void StandardPolicy<I>::allocate_tag_on_lock(Context *on_finish) {
+  ceph_assert(m_image_ctx->journal != nullptr);
 
   if (!m_image_ctx->journal->is_tag_owner()) {
     lderr(m_image_ctx->cct) << "local image not promoted" << dendl;
@@ -25,10 +26,7 @@ void StandardPolicy::allocate_tag_on_lock(Context *on_finish) {
   m_image_ctx->journal->allocate_local_tag(on_finish);
 }
 
-void StandardPolicy::cancel_external_replay(Context *on_finish) {
-  // external replay is only handled by rbd-mirror
-  assert(false);
-}
-
 } // namespace journal
 } // namespace librbd
+
+template class librbd::journal::StandardPolicy<librbd::ImageCtx>;

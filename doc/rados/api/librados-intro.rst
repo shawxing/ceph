@@ -15,7 +15,7 @@ the Ceph Storage Cluster:
 - The :term:`Ceph Monitor`, which maintains a master copy of the cluster map. 
 - The :term:`Ceph OSD Daemon` (OSD), which stores data as objects on a storage node.
 
-.. ditaa::  
+.. ditaa::
             +---------------------------------+
             |  Ceph Storage Cluster Protocol  |
             |           (librados)            |
@@ -157,7 +157,7 @@ and retrieve data. To interact with OSDs, the client app must invoke
 ``librados``  and connect to a Ceph Monitor. Once connected, ``librados``
 retrieves the  :term:`Cluster Map` from the Ceph Monitor. When the client app
 wants to read or write data, it creates an I/O context and binds to a
-:term:`pool`. The pool has an associated :term:`ruleset` that defines how it
+:term:`Pool`. The pool has an associated :term:`CRUSH rule` that defines how it
 will place data in the storage cluster. Via the I/O context, the client 
 provides the object name to ``librados``, which takes the object name
 and the cluster map (i.e., the topology of the cluster) and `computes`_ the
@@ -165,7 +165,7 @@ placement group and `OSD`_  for locating the data. Then the client application
 can read or write data. The client app doesn't need to learn about the topology
 of the cluster directly.
 
-.. ditaa:: 
+.. ditaa::
             +--------+  Retrieves  +---------------+
             | Client |------------>|  Cluster Map  |
             +--------+             +---------------+
@@ -177,7 +177,7 @@ of the cluster directly.
                  |      To
                  v
             +--------+           +---------------+
-            |  Pool  |---------->| CRUSH Ruleset |
+            |  Pool  |---------->| CRUSH Rule |
             +--------+  Selects  +---------------+
 
 
@@ -202,7 +202,7 @@ app must supply a monitor address, a username and an authentication key
 RADOS provides a number of ways for you to set the required values. For
 the monitor and encryption key settings, an easy way to handle them is to ensure
 that your Ceph configuration file contains a ``keyring`` path to a keyring file
-and at least one monitor address (e.g,. ``mon host``). For example:: 
+and at least one monitor address (e.g., ``mon host``). For example::
 
 	[global]
 	mon host = 192.168.1.1
@@ -217,7 +217,8 @@ these capabilities. The following diagram provides a high-level flow for the
 initial connection.
 
 
-.. ditaa:: +---------+     +---------+
+.. ditaa::
+           +---------+     +---------+
            | Client  |     | Monitor |
            +---------+     +---------+
                 |               |
@@ -266,17 +267,18 @@ it and connecting to the cluster might look something like this:
 .. code-block:: c
 
 	#include <stdio.h>
+	#include <stdlib.h>
 	#include <string.h>
 	#include <rados/librados.h>
 
-	int main (int argc, char argv**) 
+	int main (int argc, const char **argv) 
 	{
 
 		/* Declare the cluster handle and required arguments. */
 		rados_t cluster;
 		char cluster_name[] = "ceph";
 		char user_name[] = "client.admin";
-		uint64_t flags; 
+		uint64_t flags = 0;
 	
 		/* Initialize the cluster handle with the "ceph" cluster name and the "client.admin" user */  
 		int err;
@@ -346,7 +348,7 @@ you to initialize a ``librados::Rados`` cluster handle object:
 		librados::Rados cluster;
 		char cluster_name[] = "ceph";
 		char user_name[] = "client.admin";
-		uint64_t flags; 
+		uint64_t flags = 0; 
 	
 		/* Initialize the cluster handle with the "ceph" cluster name and "client.admin" user */ 
 		{
@@ -520,7 +522,8 @@ functionality includes:
 - Snapshot pools, list snapshots, etc.
 
 
-.. ditaa:: +---------+     +---------+     +---------+
+.. ditaa::
+           +---------+     +---------+     +---------+
            | Client  |     | Monitor |     |   OSD   |
            +---------+     +---------+     +---------+
                 |               |               |
@@ -577,10 +580,11 @@ C Example
 .. code-block:: c
 
 	#include <stdio.h>
+	#include <stdlib.h>
 	#include <string.h>
 	#include <rados/librados.h>
 
-	int main (int argc, const char argv**) 
+	int main (int argc, const char **argv) 
 	{
 		/* 
 		 * Continued from previous C example, where cluster handle and
@@ -649,7 +653,7 @@ C Example
 		}
 		
 		/* Wait for the operation to complete */
-		rados_wait_for_complete(comp);
+		rados_aio_wait_for_complete(comp);
 		
 		/* Release the asynchronous I/O complete handle to avoid memory leaks. */
 		rados_aio_release(comp);		
@@ -963,6 +967,15 @@ C++ Example
 	cluster.shutdown();
 
 
+Java Example
+--------------
+
+.. code-block:: java
+
+	cluster.ioCtxDestroy(io);
+	cluster.shutDown();
+	
+	
 Python Example
 --------------
 
@@ -983,8 +996,8 @@ PHP Example
 
 
 
-.. _user ID: ../../operations/authentication#cephx-commandline-options
-.. _CAPS: ../../operations/auth-intro#ceph-authorization-caps
+.. _user ID: ../../operations/user-management#command-line-usage
+.. _CAPS: ../../operations/user-management#authorization-capabilities
 .. _Installation (Quick): ../../../start
 .. _Smart Daemons Enable Hyperscale: ../../../architecture#smart-daemons-enable-hyperscale
 .. _Calculating PG IDs: ../../../architecture#calculating-pg-ids

@@ -3,19 +3,17 @@
 #ifndef CEPH_COMMON_PREFORKER_H
 #define CEPH_COMMON_PREFORKER_H
 
-#include "acconfig.h"
-#include <sys/types.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <errno.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <sstream>
-#include <string>
 
-#include "include/assert.h"
-#include "common/safe_io.h"
 #include "common/errno.h"
+#include "common/safe_io.h"
+#include "include/ceph_assert.h"
+#include "include/compat.h"
+#include "include/sock_compat.h"
 
 /**
  * pre-fork fork/daemonize helper class
@@ -38,30 +36,46 @@ public:
   {}
 
   int prefork(std::string &err) {
-    assert(!forked);
-    int r = socketpair(AF_UNIX, SOCK_STREAM, 0, fd);
+    ceph_assert(!forked);
     std::ostringstream oss;
+    int r = socketpair_cloexec(AF_UNIX, SOCK_STREAM, 0, fd);
     if (r < 0) {
-      oss << "[" << getpid() << "]: unable to create socketpair: " << cpp_strerror(errno);
+      int e = errno;
+      oss << "[" << getpid() << "]: unable to create socketpair: " << cpp_strerror(e);
       err = oss.str();
-      return r;
+      return (errno = e, -1);
+    }
+
+    struct sigaction sa;
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGHUP, &sa, nullptr) != 0) {
+      int e = errno;
+      oss << "[" << getpid() << "]: unable to ignore SIGHUP: " << cpp_strerror(e);
+      err = oss.str();
+      return (errno = e, -1);
     }
 
     forked = true;
 
     childpid = fork();
     if (childpid < 0) {
-      r = -errno;
-      oss << "[" << getpid() << "]: unable to fork: " << cpp_strerror(errno);
+      int e = errno;
+      oss << "[" << getpid() << "]: unable to fork: " << cpp_strerror(e);
       err = oss.str();
-      return r;
+      return (errno = e, -1);
     }
-    if (childpid == 0) {
+    if (is_child()) {
       ::close(fd[0]);
     } else {
       ::close(fd[1]);
     }
     return 0;
+  }
+
+  int get_signal_fd() const {
+    return forked ? fd[1] : 0;
   }
 
   bool is_child() {
@@ -73,7 +87,7 @@ public:
   }
 
   int parent_wait(std::string &err_msg) {
-    assert(forked);
+    ceph_assert(forked);
 
     int r = -1;
     std::ostringstream oss;
@@ -83,7 +97,6 @@ public:
       ::close(0);
       ::close(1);
       ::close(2);
-      r = 0;
     } else if (err) {
       oss << "[" << getpid() << "]: " << cpp_strerror(err);
     } else {
@@ -108,21 +121,19 @@ public:
 
   int signal_exit(int r) {
     if (forked) {
-      // tell parent.  this shouldn't fail, but if it does, pass the
-      // error back to the parent.
-      int ret = safe_write(fd[1], &r, sizeof(r));
-      if (ret <= 0)
-	return ret;
+      /* If we get an error here, it's too late to do anything reasonable about it. */
+      [[maybe_unused]] auto n = safe_write(fd[1], &r, sizeof(r));
     }
     return r;
   }
   void exit(int r) {
-    signal_exit(r);
+    if (is_child())
+        signal_exit(r);
     ::exit(r);
   }
 
   void daemonize() {
-    assert(forked);
+    ceph_assert(forked);
     static int r = -1;
     int r2 = ::write(fd[1], &r, sizeof(r));
     r += r2;  // make the compiler shut up about the unused return code from ::write(2).

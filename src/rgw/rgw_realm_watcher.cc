@@ -1,10 +1,11 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #include "common/errno.h"
 
 #include "rgw_realm_watcher.h"
-#include "rgw_rados.h"
+#include "rgw_tools.h"
+#include "rgw_zone.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -12,7 +13,7 @@
 #define dout_prefix (*_dout << "rgw realm watcher: ")
 
 
-RGWRealmWatcher::RGWRealmWatcher(CephContext* cct, RGWRealm& realm)
+RGWRealmWatcher::RGWRealmWatcher(CephContext* cct, const RGWRealm& realm)
   : cct(cct)
 {
   // no default realm, nothing to watch
@@ -51,10 +52,10 @@ void RGWRealmWatcher::handle_notify(uint64_t notify_id, uint64_t cookie,
   pool_ctx.notify_ack(watch_oid, notify_id, cookie, reply);
 
   try {
-    auto p = bl.begin();
+    auto p = bl.cbegin();
     while (!p.end()) {
       RGWRealmNotify notify;
-      ::decode(notify, p);
+      decode(notify, p);
       auto watcher = watchers.find(notify);
       if (watcher == watchers.end()) {
         lderr(cct) << "Failed to find a watcher for notify type "
@@ -70,16 +71,14 @@ void RGWRealmWatcher::handle_notify(uint64_t notify_id, uint64_t cookie,
 
 void RGWRealmWatcher::handle_error(uint64_t cookie, int err)
 {
+  lderr(cct) << "RGWRealmWatcher::handle_error oid=" << watch_oid << " err=" << err << dendl;
   if (cookie != watch_handle)
     return;
 
-  if (err == -ENOTCONN) {
-    ldout(cct, 4) << "Disconnected watch on " << watch_oid << dendl;
-    watch_restart();
-  }
+  watch_restart();
 }
 
-int RGWRealmWatcher::watch_start(RGWRealm& realm)
+int RGWRealmWatcher::watch_start(const RGWRealm& realm)
 {
   // initialize a Rados client
   int r = rados.init_with_context(cct);
@@ -96,8 +95,8 @@ int RGWRealmWatcher::watch_start(RGWRealm& realm)
   }
 
   // open an IoCtx for the realm's pool
-  auto pool = realm.get_pool_name(cct);
-  r = rados.ioctx_create(pool.c_str(), pool_ctx);
+  rgw_pool pool(realm.get_pool(cct));
+  r = rgw_init_ioctx(&rados, pool, pool_ctx);
   if (r < 0) {
     lderr(cct) << "Failed to open pool " << pool
         << " with " << cpp_strerror(-r) << dendl;
@@ -123,16 +122,19 @@ int RGWRealmWatcher::watch_start(RGWRealm& realm)
 
 int RGWRealmWatcher::watch_restart()
 {
-  assert(!watch_oid.empty());
+  ceph_assert(!watch_oid.empty());
   int r = pool_ctx.unwatch2(watch_handle);
   if (r < 0) {
     lderr(cct) << "Failed to unwatch on " << watch_oid
         << " with " << cpp_strerror(-r) << dendl;
   }
   r = pool_ctx.watch2(watch_oid, &watch_handle, this);
-  if (r < 0)
+  if (r < 0) {
     lderr(cct) << "Failed to restart watch on " << watch_oid
         << " with " << cpp_strerror(-r) << dendl;
+    pool_ctx.close();
+    watch_oid.clear();
+  }
   return r;
 }
 

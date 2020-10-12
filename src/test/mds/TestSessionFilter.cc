@@ -16,9 +16,6 @@
 
 #include "include/stringify.h"
 #include "mds/SessionMap.h"
-#include "common/ceph_argparse.h"
-#include "common/common_init.h"
-#include "global/global_init.h"
 
 #include "gtest/gtest.h"
 
@@ -77,15 +74,13 @@ TEST(MDSSessionFilter, IdEquality)
   SessionFilter filter;
   std::stringstream ss;
   filter.parse({"id=123"}, &ss);
-  Session *a = new Session();;
-  Session *b = new Session();;
+  auto a = ceph::make_ref<Session>(nullptr);;
+  auto b = ceph::make_ref<Session>(nullptr);;
   a->info.inst.name.parse("client.123");
   b->info.inst.name.parse("client.456");
 
   ASSERT_TRUE(filter.match(*a, [](client_t c) -> bool {return false;}));
   ASSERT_FALSE(filter.match(*b, [](client_t c) -> bool {return false;}));
-  a->put();
-  b->put();
 }
 
 TEST(MDSSessionFilter, StateEquality)
@@ -93,15 +88,13 @@ TEST(MDSSessionFilter, StateEquality)
   SessionFilter filter;
   std::stringstream ss;
   filter.parse({"state=closing"}, &ss);
-  Session *a = new Session();
+  auto a = ceph::make_ref<Session>(nullptr);
   a->set_state(Session::STATE_CLOSING);
-  Session *b = new Session();
+  auto b = ceph::make_ref<Session>(nullptr);
   b->set_state(Session::STATE_OPENING);
 
   ASSERT_TRUE(filter.match(*a, [](client_t c) -> bool {return false;}));
   ASSERT_FALSE(filter.match(*b, [](client_t c) -> bool {return false;}));
-  a->put();
-  b->put();
 }
 
 TEST(MDSSessionFilter, AuthEquality)
@@ -109,15 +102,13 @@ TEST(MDSSessionFilter, AuthEquality)
   SessionFilter filter;
   std::stringstream ss;
   filter.parse({"auth_name=rhubarb"}, &ss);
-  Session *a = new Session();
+  auto a = ceph::make_ref<Session>(nullptr);
   a->info.auth_name.set_id("rhubarb");
-  Session *b = new Session();
+  auto b = ceph::make_ref<Session>(nullptr);
   b->info.auth_name.set_id("custard");
 
   ASSERT_TRUE(filter.match(*a, [](client_t c) -> bool {return false;}));
   ASSERT_FALSE(filter.match(*b, [](client_t c) -> bool {return false;}));
-  a->put();
-  b->put();
 }
 
 TEST(MDSSessionFilter, MetadataEquality)
@@ -126,15 +117,16 @@ TEST(MDSSessionFilter, MetadataEquality)
   std::stringstream ss;
   int r = filter.parse({"client_metadata.root=/rhubarb"}, &ss);
   ASSERT_EQ(r, 0);
-  Session *a = new Session();
-  a->set_client_metadata({{"root", "/rhubarb"}});
-  Session *b = new Session();
-  b->set_client_metadata({{"root", "/custard"}});
+  client_metadata_t meta;
+  auto a = ceph::make_ref<Session>(nullptr);
+  meta.kv_map = {{"root", "/rhubarb"}};
+  a->set_client_metadata(meta);
+  auto b = ceph::make_ref<Session>(nullptr);
+  meta.kv_map = {{"root", "/custard"}};
+  b->set_client_metadata(meta);
 
   ASSERT_TRUE(filter.match(*a, [](client_t c) -> bool {return false;}));
   ASSERT_FALSE(filter.match(*b, [](client_t c) -> bool {return false;}));
-  a->put();
-  b->put();
 }
 
 TEST(MDSSessionFilter, ReconnectingEquality)
@@ -143,20 +135,8 @@ TEST(MDSSessionFilter, ReconnectingEquality)
   std::stringstream ss;
   int r = filter.parse({"reconnecting=true"}, &ss);
   ASSERT_EQ(r, 0);
-  Session *a = new Session();
+  auto a = ceph::make_ref<Session>(nullptr);
 
   ASSERT_TRUE(filter.match(*a, [](client_t c) -> bool {return true;}));
   ASSERT_FALSE(filter.match(*a, [](client_t c) -> bool {return false;}));
-  a->put();
 }
-
-int main(int argc, char **argv) {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
-
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0); 
-  common_init_finish(g_ceph_context);
-
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-} 

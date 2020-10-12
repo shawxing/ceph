@@ -24,7 +24,11 @@ public:
                            prog_ctx);
   }
 
-  virtual void send();
+  TrimRequest(ImageCtxT &image_ctx, Context *on_finish,
+	      uint64_t original_size, uint64_t new_size,
+	      ProgressContext &prog_ctx);
+
+  void send() override;
 
 protected:
   /**
@@ -33,64 +37,64 @@ protected:
    *
    * @verbatim
    *
-   *     <start> . . . . > STATE_FINISHED . . . . . . . . .
-   *      |   .                                           .
-   *      |   . . . . . . . . . . . .                     .
-   *      |                         .                     .
-   *      v                         .                     .
-   * STATE_COPYUP_OBJECTS . . .     .                     .
-   *      |                   .     .                     .
-   *      |                   .     .                     .
-   *      v                   v     v                     .
-   * STATE_PRE_REMOVE ---> STATE_REMOVE_OBJECTS           .
-   *                                |   .   .             .
-   *        /-----------------------/   .   . . . . . .   .
-   *        |                           .             .   .
-   *        v                           v             v   v
-   * STATE_POST_REMOVE --> STATE_CLEAN_BOUNDARY ---> <finish>
-   *        .                                           ^
-   *        .                                           .
-   *        . . . . . . . . . . . . . . . . . . . . . . .
-   *
-   * @endverbatim
+   *     <start>  . . . . . . . . . . . . . . . . .
+   *        |                                     .
+   *        v (skip if not needed)                .
+   * STATE_PRE_TRIM                               .
+   *        |                                     .
+   *        v (skip if not needed)                .
+   * STATE_COPYUP_OBJECTS                         .
+   *        |                                     .
+   *        v (skip if not needed)                .
+   * STATE_REMOVE_OBJECTS                         .
+   *        |                                     .
+   *        v (skip if not needed)                .
+   * STATE_POST_TRIM                              .
+   *        |                                     .
+   *        v (skip if not needed)                .
+   * STATE_CLEAN_BOUNDARY                         .
+   *        |                                     .
+   *        v                                     .
+   * STATE_FINISHED < . . . . . . . . . . . . . . .
+   *        |
+   *        v
+   *    <finish>
    *
    * The _COPYUP_OBJECTS state is skipped if there is no parent overlap
    * within the new image size and the image does not have any snapshots.
-   * The _PRE_REMOVE/_POST_REMOVE states are skipped if the object map
+   * The _PRE_TRIM/_POST_TRIM states are skipped if the object map
    * isn't enabled. The _REMOVE_OBJECTS state is skipped if no whole objects
    * are removed.  The _CLEAN_BOUNDARY state is skipped if no boundary
    * objects are cleaned.  The state machine will immediately transition
    * to _FINISHED state if there are no bytes to trim.
-   */ 
+   */
 
   enum State {
+    STATE_PRE_TRIM,
     STATE_COPYUP_OBJECTS,
-    STATE_PRE_REMOVE,
     STATE_REMOVE_OBJECTS,
-    STATE_POST_REMOVE,
+    STATE_POST_TRIM,
     STATE_CLEAN_BOUNDARY,
     STATE_FINISHED
   };
 
-  virtual bool should_complete(int r);
+  bool should_complete(int r) override;
 
-  State m_state;
+  State m_state = STATE_PRE_TRIM;
 
 private:
   uint64_t m_delete_start;
+  uint64_t m_delete_start_min = 0;
   uint64_t m_num_objects;
   uint64_t m_delete_off;
   uint64_t m_new_size;
   ProgressContext &m_prog_ctx;
 
-  TrimRequest(ImageCtxT &image_ctx, Context *on_finish,
-	      uint64_t original_size, uint64_t new_size,
-	      ProgressContext &prog_ctx);
-
+  void send_pre_trim();
   void send_copyup_objects();
   void send_remove_objects();
-  void send_pre_remove();
-  void send_post_remove();
+  void send_post_trim();
+
   void send_clean_boundary();
   void send_finish(int r);
 };

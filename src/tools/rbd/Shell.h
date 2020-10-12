@@ -14,13 +14,13 @@ namespace rbd {
 
 class Shell {
 public:
-  typedef std::vector<const char *> Arguments;
   typedef std::vector<std::string> CommandSpec;
 
   struct Action {
     typedef void (*GetArguments)(boost::program_options::options_description *,
                                  boost::program_options::options_description *);
-    typedef int (*Execute)(const boost::program_options::variables_map &);
+    typedef int (*Execute)(const boost::program_options::variables_map &,
+                           const std::vector<std::string> &);
 
     CommandSpec command_spec;
     CommandSpec alias_command_spec;
@@ -28,15 +28,16 @@ public:
     const std::string help;
     GetArguments get_arguments;
     Execute execute;
+    bool visible;
 
     template <typename Args, typename Execute>
     Action(const std::initializer_list<std::string> &command_spec,
            const std::initializer_list<std::string> &alias_command_spec,
            const std::string &description, const std::string &help,
-           Args args, Execute execute)
+           Args args, Execute execute, bool visible = true)
         : command_spec(command_spec), alias_command_spec(alias_command_spec),
           description(description), help(help), get_arguments(args),
-          execute(execute) {
+          execute(execute), visible(visible) {
       Shell::get_actions().push_back(this);
     }
 
@@ -48,7 +49,7 @@ public:
     }
   };
 
-  int execute(const Arguments &argument);
+  int execute(int argc, const char **argv);
 
 private:
   static std::vector<Action *>& get_actions();

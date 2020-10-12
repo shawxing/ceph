@@ -9,7 +9,6 @@
 #include <set>
 #include <map>
 #include <string>
-#include "include/memory.h"
 #include <boost/scoped_ptr.hpp>
 #include "leveldb/db.h"
 #include "leveldb/env.h"
@@ -23,13 +22,15 @@
 #include <errno.h>
 #include "common/errno.h"
 #include "common/dout.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 #include "common/Formatter.h"
 #include "common/Cond.h"
 
 #include "common/ceph_context.h"
+#include "include/common_fwd.h"
 
-class PerfCounters;
+// reinclude our assert to clobber the system one
+# include "include/ceph_assert.h"
 
 enum {
   l_leveldb_first = 34300,
@@ -56,25 +57,27 @@ class LevelDBStore : public KeyValueDB {
   CephContext *cct;
   PerfCounters *logger;
   CephLevelDBLogger *ceph_logger;
-  string path;
+  std::string path;
   boost::scoped_ptr<leveldb::Cache> db_cache;
 #ifdef HAVE_LEVELDB_FILTER_POLICY
   boost::scoped_ptr<const leveldb::FilterPolicy> filterpolicy;
 #endif
   boost::scoped_ptr<leveldb::DB> db;
 
-  int do_open(ostream &out, bool create_if_missing);
+  int load_leveldb_options(bool create_if_missing, leveldb::Options &opts);
+  int do_open(std::ostream &out, bool create_if_missing);
 
   // manage async compactions
-  Mutex compact_queue_lock;
-  Cond compact_queue_cond;
-  list< pair<string,string> > compact_queue;
+  ceph::mutex compact_queue_lock =
+    ceph::make_mutex("LevelDBStore::compact_thread_lock");
+  ceph::condition_variable compact_queue_cond;
+  std::list<std::pair<std::string, std::string>> compact_queue;
   bool compact_queue_stop;
   class CompactThread : public Thread {
     LevelDBStore *db;
   public:
     explicit CompactThread(LevelDBStore *d) : db(d) {}
-    void *entry() {
+    void *entry() override {
       db->compact_thread_entry();
       return NULL;
     }
@@ -83,30 +86,34 @@ class LevelDBStore : public KeyValueDB {
 
   void compact_thread_entry();
 
-  void compact_range(const string& start, const string& end) {
+  void compact_range(const std::string& start, const std::string& end) {
     leveldb::Slice cstart(start);
     leveldb::Slice cend(end);
     db->CompactRange(&cstart, &cend);
   }
-  void compact_range_async(const string& start, const string& end);
+  void compact_range_async(const std::string& start, const std::string& end);
 
 public:
   /// compact the underlying leveldb store
-  void compact();
+  void compact() override;
+
+  void compact_async() override {
+    compact_range_async({}, {});
+  }
 
   /// compact db for all keys with a given prefix
-  void compact_prefix(const string& prefix) {
+  void compact_prefix(const std::string& prefix) override {
     compact_range(prefix, past_prefix(prefix));
   }
-  void compact_prefix_async(const string& prefix) {
+  void compact_prefix_async(const std::string& prefix) override {
     compact_range_async(prefix, past_prefix(prefix));
   }
-  void compact_range(const string& prefix,
-		     const string& start, const string& end) {
+  void compact_range(const std::string& prefix,
+		     const std::string& start, const std::string& end) override {
     compact_range(combine_strings(prefix, start), combine_strings(prefix, end));
   }
-  void compact_range_async(const string& prefix,
-			   const string& start, const string& end) {
+  void compact_range_async(const std::string& prefix,
+			   const std::string& start, const std::string& end) override {
     compact_range_async(combine_strings(prefix, start),
 			combine_strings(prefix, end));
   }
@@ -135,7 +142,7 @@ public:
     bool error_if_exists;
     bool paranoid_checks;
 
-    string log_file;
+    std::string log_file;
 
     options_t() :
       write_buffer_size(0), //< 0 means default
@@ -150,7 +157,7 @@ public:
     {}
   } options;
 
-  LevelDBStore(CephContext *c, const string &path) :
+  LevelDBStore(CephContext *c, const std::string &path) :
     cct(c),
     logger(NULL),
     ceph_logger(NULL),
@@ -159,27 +166,28 @@ public:
 #ifdef HAVE_LEVELDB_FILTER_POLICY
     filterpolicy(NULL),
 #endif
-    compact_queue_lock("LevelDBStore::compact_thread_lock"),
     compact_queue_stop(false),
     compact_thread(this),
     options()
   {}
 
-  ~LevelDBStore();
+  ~LevelDBStore() override;
 
-  static int _test_init(const string& dir);
-  int init(string option_str="");
+  static int _test_init(const std::string& dir);
+  int init(std::string option_str="") override;
 
   /// Opens underlying db
-  int open(ostream &out) {
-    return do_open(out, false);
-  }
+  int open(std::ostream &out, const std::string& cfs="") override;
   /// Creates underlying db if missing and opens it
-  int create_and_open(ostream &out) {
-    return do_open(out, true);
-  }
+  int create_and_open(std::ostream &out, const std::string& cfs="") override;
 
-  void close();
+  void close() override;
+
+  PerfCounters *get_perf_counters() override
+  {
+    return logger;
+  }
+  int repair(std::ostream &out) override;
 
   class LevelDBTransactionImpl : public KeyValueDB::TransactionImpl {
   public:
@@ -187,33 +195,42 @@ public:
     LevelDBStore *db;
     explicit LevelDBTransactionImpl(LevelDBStore *db) : db(db) {}
     void set(
-      const string &prefix,
-      const string &k,
-      const bufferlist &bl);
+      const std::string &prefix,
+      const std::string &k,
+      const ceph::buffer::list &bl) override;
+    using KeyValueDB::TransactionImpl::set;
     void rmkey(
-      const string &prefix,
-      const string &k);
+      const std::string &prefix,
+      const std::string &k) override;
     void rmkeys_by_prefix(
-      const string &prefix
-      );
+      const std::string &prefix
+      ) override;
+    virtual void rm_range_keys(
+      const std::string &prefix,
+      const std::string &start,
+      const std::string &end) override;
+
+    using KeyValueDB::TransactionImpl::rmkey;
   };
 
-  KeyValueDB::Transaction get_transaction() {
+  KeyValueDB::Transaction get_transaction() override {
     return std::make_shared<LevelDBTransactionImpl>(this);
   }
 
-  int submit_transaction(KeyValueDB::Transaction t);
-  int submit_transaction_sync(KeyValueDB::Transaction t);
+  int submit_transaction(KeyValueDB::Transaction t) override;
+  int submit_transaction_sync(KeyValueDB::Transaction t) override;
   int get(
-    const string &prefix,
-    const std::set<string> &key,
-    std::map<string, bufferlist> *out
-    );
+    const std::string &prefix,
+    const std::set<std::string> &key,
+    std::map<std::string, ceph::buffer::list> *out
+    ) override;
 
-  int get(const string &prefix, 
-    const string &key,   
-    bufferlist *value);
-      
+  int get(const std::string &prefix, 
+	  const std::string &key,   
+	  ceph::buffer::list *value) override;
+
+  using KeyValueDB::get;
+
   class LevelDBWholeSpaceIteratorImpl :
     public KeyValueDB::WholeSpaceIteratorImpl {
   protected:
@@ -221,23 +238,23 @@ public:
   public:
     explicit LevelDBWholeSpaceIteratorImpl(leveldb::Iterator *iter) :
       dbiter(iter) { }
-    virtual ~LevelDBWholeSpaceIteratorImpl() { }
+    ~LevelDBWholeSpaceIteratorImpl() override { }
 
-    int seek_to_first() {
+    int seek_to_first() override {
       dbiter->SeekToFirst();
       return dbiter->status().ok() ? 0 : -1;
     }
-    int seek_to_first(const string &prefix) {
+    int seek_to_first(const std::string &prefix) override {
       leveldb::Slice slice_prefix(prefix);
       dbiter->Seek(slice_prefix);
       return dbiter->status().ok() ? 0 : -1;
     }
-    int seek_to_last() {
+    int seek_to_last() override {
       dbiter->SeekToLast();
       return dbiter->status().ok() ? 0 : -1;
     }
-    int seek_to_last(const string &prefix) {
-      string limit = past_prefix(prefix);
+    int seek_to_last(const std::string &prefix) override {
+      std::string limit = past_prefix(prefix);
       leveldb::Slice slice_limit(limit);
       dbiter->Seek(slice_limit);
 
@@ -248,45 +265,45 @@ public:
       }
       return dbiter->status().ok() ? 0 : -1;
     }
-    int upper_bound(const string &prefix, const string &after) {
+    int upper_bound(const std::string &prefix, const std::string &after) override {
       lower_bound(prefix, after);
       if (valid()) {
-	pair<string,string> key = raw_key();
+	std::pair<std::string,std::string> key = raw_key();
 	if (key.first == prefix && key.second == after)
 	  next();
       }
       return dbiter->status().ok() ? 0 : -1;
     }
-    int lower_bound(const string &prefix, const string &to) {
-      string bound = combine_strings(prefix, to);
+    int lower_bound(const std::string &prefix, const std::string &to) override {
+      std::string bound = combine_strings(prefix, to);
       leveldb::Slice slice_bound(bound);
       dbiter->Seek(slice_bound);
       return dbiter->status().ok() ? 0 : -1;
     }
-    bool valid() {
+    bool valid() override {
       return dbiter->Valid();
     }
-    int next() {
+    int next() override {
       if (valid())
 	dbiter->Next();
       return dbiter->status().ok() ? 0 : -1;
     }
-    int prev() {
+    int prev() override {
       if (valid())
 	dbiter->Prev();
       return dbiter->status().ok() ? 0 : -1;
     }
-    string key() {
-      string out_key;
+    std::string key() override {
+      std::string out_key;
       split_key(dbiter->key(), 0, &out_key);
       return out_key;
     }
-    pair<string,string> raw_key() {
-      string prefix, key;
+    std::pair<std::string,std::string> raw_key() override {
+      std::string prefix, key;
       split_key(dbiter->key(), &prefix, &key);
-      return make_pair(prefix, key);
+      return std::make_pair(prefix, key);
     }
-    bool raw_key_is_prefixed(const string &prefix) {
+    bool raw_key_is_prefixed(const std::string &prefix) override {
       leveldb::Slice key = dbiter->key();
       if ((key.size() > prefix.length()) && (key[prefix.length()] == '\0')) {
         return memcmp(key.data(), prefix.c_str(), prefix.length()) == 0;
@@ -294,45 +311,31 @@ public:
         return false;
       }
     }
-    bufferlist value() {
+    ceph::buffer::list value() override {
       return to_bufferlist(dbiter->value());
     }
 
-    bufferptr value_as_ptr() {
+    ceph::bufferptr value_as_ptr() override {
       leveldb::Slice data = dbiter->value();
-      return bufferptr(data.data(), data.size());
+      return ceph::bufferptr(data.data(), data.size());
     }
 
-    int status() {
+    int status() override {
       return dbiter->status().ok() ? 0 : -1;
     }
   };
 
-  class LevelDBSnapshotIteratorImpl : public LevelDBWholeSpaceIteratorImpl {
-    leveldb::DB *db;
-    const leveldb::Snapshot *snapshot;
-  public:
-    LevelDBSnapshotIteratorImpl(leveldb::DB *db, const leveldb::Snapshot *s,
-				leveldb::Iterator *iter) :
-      LevelDBWholeSpaceIteratorImpl(iter), db(db), snapshot(s) { }
-
-    ~LevelDBSnapshotIteratorImpl() {
-      assert(snapshot != NULL);
-      db->ReleaseSnapshot(snapshot);
-    }
-  };
-
   /// Utility
-  static string combine_strings(const string &prefix, const string &value);
-  static int split_key(leveldb::Slice in, string *prefix, string *key);
-  static bufferlist to_bufferlist(leveldb::Slice in);
-  static string past_prefix(const string &prefix) {
-    string limit = prefix;
+  static std::string combine_strings(const std::string &prefix, const std::string &value);
+  static int split_key(leveldb::Slice in, std::string *prefix, std::string *key);
+  static ceph::buffer::list to_bufferlist(leveldb::Slice in);
+  static std::string past_prefix(const std::string &prefix) {
+    std::string limit = prefix;
     limit.push_back(1);
     return limit;
   }
 
-  virtual uint64_t get_estimated_size(map<string,uint64_t> &extra) {
+  uint64_t get_estimated_size(std::map<std::string,std::uint64_t> &extra) override {
     DIR *store_dir = opendir(path.c_str());
     if (!store_dir) {
       lderr(cct) << __func__ << " something happened opening the store: "
@@ -347,12 +350,12 @@ public:
 
     struct dirent *entry = NULL;
     while ((entry = readdir(store_dir)) != NULL) {
-      string n(entry->d_name);
+      std::string n(entry->d_name);
 
       if (n == "." || n == "..")
         continue;
 
-      string fpath = path + '/' + n;
+      std::string fpath = path + '/' + n;
       struct stat s;
       int err = stat(fpath.c_str(), &s);
       if (err < 0)
@@ -371,12 +374,12 @@ public:
       }
 
       size_t pos = n.find_last_of('.');
-      if (pos == string::npos) {
+      if (pos == std::string::npos) {
         misc_size += s.st_size;
         continue;
       }
 
-      string ext = n.substr(pos+1);
+      std::string ext = n.substr(pos+1);
       if (ext == "sst") {
         sst_size += s.st_size;
       } else if (ext == "log") {
@@ -399,22 +402,9 @@ err:
   }
 
 
-protected:
-  WholeSpaceIterator _get_iterator() {
+  WholeSpaceIterator get_wholespace_iterator(IteratorOpts opts = 0) override {
     return std::make_shared<LevelDBWholeSpaceIteratorImpl>(
 	db->NewIterator(leveldb::ReadOptions()));
-  }
-
-  WholeSpaceIterator _get_snapshot_iterator() {
-    const leveldb::Snapshot *snapshot;
-    leveldb::ReadOptions options;
-
-    snapshot = db->GetSnapshot();
-    options.snapshot = snapshot;
-
-    return std::make_shared<LevelDBSnapshotIteratorImpl>(
-        db.get(), snapshot,
-	db->NewIterator(options));
   }
 
 };

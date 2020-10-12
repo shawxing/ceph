@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/object_map/InvalidateRequest.h"
@@ -12,13 +12,13 @@ namespace object_map {
 template <typename I>
 struct MockInvalidateRequestBase {
   static std::list<InvalidateRequest<I>*> s_requests;
-  uint64_t snap_id;
-  bool force;
-  Context *on_finish;
+  uint64_t snap_id = 0;
+  bool force = false;
+  Context *on_finish = nullptr;
 
   static InvalidateRequest<I>* create(I &image_ctx, uint64_t snap_id,
                                       bool force, Context *on_finish) {
-    assert(!s_requests.empty());
+    ceph_assert(!s_requests.empty());
     InvalidateRequest<I>* req = s_requests.front();
     req->snap_id = snap_id;
     req->force = force;

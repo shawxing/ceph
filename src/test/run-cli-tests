@@ -43,19 +43,12 @@ mkdir -p "$FAKE_HOME"
 FAILED=0
 FAILEDTOOLS=""
 for tool in "$SRCDIR"/cli/*; do
-    if [ x`uname`x = xFreeBSDx ]; then
-    	if [ x"$tool"x = x"$SRCDIR/cli/rbd"x ]; then
-	    echo "Skipping test: $tool."
-	    continue
-    	else
-    	    echo "Running test: $tool."
-    	fi
-    fi 
     toolname="$(basename "$tool")"
     install -d -m0755 -- "$BUILDDIR/cli/$toolname"
     if ! env -i \
 	PATH="$BUILDDIR_ABS/..:$SRCDIR_ABS/..:$PATH" \
 	CEPH_CONF=/dev/null \
+	CEPH_ARGS="--no-mon-config" \
 	CCACHE_DIR="$CCACHE_DIR" \
 	CC="$CC" \
 	CXX="$CXX" \

@@ -1,8 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #include "rgw_period_history.h"
-#include "rgw_rados.h"
+#include "rgw_zone.h"
+
+#include "include/ceph_assert.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -67,6 +69,15 @@ bool Cursor::has_next() const
   return epoch < history->get_newest_epoch();
 }
 
+bool operator==(const Cursor& lhs, const Cursor& rhs)
+{
+  return lhs.history == rhs.history && lhs.epoch == rhs.epoch;
+}
+
+bool operator!=(const Cursor& lhs, const Cursor& rhs)
+{
+  return !(lhs == rhs);
+}
 
 class RGWPeriodHistory::Impl final {
  public:
@@ -126,6 +137,8 @@ RGWPeriodHistory::Impl::Impl(CephContext* cct, Puller* puller,
 
     // get a cursor to the current period
     current_cursor = make_cursor(current_history, current_period.get_realm_epoch());
+  } else {
+    current_history = histories.end();
   }
 }
 
@@ -290,7 +303,7 @@ Cursor RGWPeriodHistory::Impl::insert_locked(RGWPeriod&& period)
 RGWPeriodHistory::Impl::Set::iterator
 RGWPeriodHistory::Impl::merge(Set::iterator dst, Set::iterator src)
 {
-  assert(dst->get_newest_epoch() + 1 == src->get_oldest_epoch());
+  ceph_assert(dst->get_newest_epoch() + 1 == src->get_oldest_epoch());
 
   // always merge into current_history
   if (src == current_history) {

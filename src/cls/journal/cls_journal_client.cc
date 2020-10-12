@@ -2,24 +2,26 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "cls/journal/cls_journal_client.h"
+#include "include/rados/librados.hpp"
 #include "include/buffer.h"
 #include "include/Context.h"
 #include "common/Cond.h"
 #include <errno.h>
-#include <map>
 
 namespace cls {
 namespace journal {
 namespace client {
+using ceph::encode;
+using ceph::decode;
 
 namespace {
 
 struct C_AioExec : public Context {
-  librados::IoCtx ioctx;
+  librados::IoCtx &ioctx;
   std::string oid;
 
-  C_AioExec(librados::IoCtx &_ioctx, const std::string &_oid) : oid(_oid) {
-    ioctx.dup(_ioctx);
+  C_AioExec(librados::IoCtx &_ioctx, const std::string &_oid)
+    : ioctx(_ioctx), oid(_oid) {
   }
 
   static void rados_callback(rados_completion_t c, void *arg) {
@@ -40,30 +42,30 @@ struct C_ClientList : public C_AioExec {
 
   void send(const std::string &start_after) {
     bufferlist inbl;
-    ::encode(start_after, inbl);
-    ::encode(JOURNAL_MAX_RETURN, inbl);
+    encode(start_after, inbl);
+    encode(JOURNAL_MAX_RETURN, inbl);
 
     librados::ObjectReadOperation op;
     op.exec("journal", "client_list", inbl);
 
     outbl.clear();
     librados::AioCompletion *rados_completion =
-       librados::Rados::aio_create_completion(this, rados_callback, NULL);
+       librados::Rados::aio_create_completion(this, rados_callback);
     int r = ioctx.aio_operate(oid, rados_completion, &op, &outbl);
-    assert(r == 0);
+    ceph_assert(r == 0);
     rados_completion->release();
   }
 
-  virtual void complete(int r) {
+  void complete(int r) override {
     if (r < 0) {
       finish(r);
       return;
     }
 
     try {
-      bufferlist::iterator iter = outbl.begin();
+      auto iter = outbl.cbegin();
       std::set<cls::journal::Client> partial_clients;
-      ::decode(partial_clients, iter);
+      decode(partial_clients, iter);
 
       std::string start_after;
       if (!partial_clients.empty()) {
@@ -81,7 +83,7 @@ struct C_ClientList : public C_AioExec {
     }
   }
 
-  virtual void finish(int r) {
+  void finish(int r) override {
     on_finish->complete(r);
     delete this;
   }
@@ -109,19 +111,19 @@ struct C_ImmutableMetadata : public C_AioExec {
     op.exec("journal", "get_pool_id", inbl);
 
     librados::AioCompletion *rados_completion =
-      librados::Rados::aio_create_completion(this, rados_callback, NULL);
+      librados::Rados::aio_create_completion(this, rados_callback);
     int r = ioctx.aio_operate(oid, rados_completion, &op, &outbl);
-    assert(r == 0);
+    ceph_assert(r == 0);
     rados_completion->release();
   }
 
-  virtual void finish(int r) {
+  void finish(int r) override {
     if (r == 0) {
       try {
-        bufferlist::iterator iter = outbl.begin();
-        ::decode(*order, iter);
-        ::decode(*splay_width, iter);
-        ::decode(*pool_id, iter);
+        auto iter = outbl.cbegin();
+        decode(*order, iter);
+        decode(*splay_width, iter);
+        decode(*pool_id, iter);
       } catch (const buffer::error &err) {
         r = -EBADMSG;
       }
@@ -149,18 +151,18 @@ struct C_MutableMetadata : public C_AioExec {
     op.exec("journal", "get_active_set", inbl);
 
     librados::AioCompletion *rados_completion =
-      librados::Rados::aio_create_completion(this, rados_callback, NULL);
+      librados::Rados::aio_create_completion(this, rados_callback);
     int r = ioctx.aio_operate(oid, rados_completion, &op, &outbl);
-    assert(r == 0);
+    ceph_assert(r == 0);
     rados_completion->release();
   }
 
-  virtual void finish(int r) {
+  void finish(int r) override {
     if (r == 0) {
       try {
-        bufferlist::iterator iter = outbl.begin();
-        ::decode(*minimum_set, iter);
-        ::decode(*active_set, iter);
+        auto iter = outbl.cbegin();
+        decode(*minimum_set, iter);
+        decode(*active_set, iter);
         client_list->send("");
       } catch (const buffer::error &err) {
         r = -EBADMSG;
@@ -175,15 +177,22 @@ struct C_MutableMetadata : public C_AioExec {
 
 } // anonymous namespace
 
+void create(librados::ObjectWriteOperation *op,
+            uint8_t order, uint8_t splay, int64_t pool_id) {
+  bufferlist bl;
+  encode(order, bl);
+  encode(splay, bl);
+  encode(pool_id, bl);
+
+  op->exec("journal", "create", bl);
+}
+
 int create(librados::IoCtx &ioctx, const std::string &oid, uint8_t order,
            uint8_t splay, int64_t pool_id) {
-  bufferlist inbl;
-  ::encode(order, inbl);
-  ::encode(splay, inbl);
-  ::encode(pool_id, inbl);
+  librados::ObjectWriteOperation op;
+  create(&op, order, splay, pool_id);
 
-  bufferlist outbl;
-  int r = ioctx.exec(oid, "journal", "create", inbl, outbl);
+  int r = ioctx.operate(oid, &op);
   if (r < 0) {
     return r;
   }
@@ -211,13 +220,13 @@ void get_mutable_metadata(librados::IoCtx &ioctx, const std::string &oid,
 
 void set_minimum_set(librados::ObjectWriteOperation *op, uint64_t object_set) {
   bufferlist bl;
-  ::encode(object_set, bl);
+  encode(object_set, bl);
   op->exec("journal", "set_minimum_set", bl);
 }
 
 void set_active_set(librados::ObjectWriteOperation *op, uint64_t object_set) {
   bufferlist bl;
-  ::encode(object_set, bl);
+  encode(object_set, bl);
   op->exec("journal", "set_active_set", bl);
 }
 
@@ -232,7 +241,7 @@ int get_client(librados::IoCtx &ioctx, const std::string &oid,
     return r;
   }
 
-  bufferlist::iterator iter = out_bl.begin();
+  auto iter = out_bl.cbegin();
   r = get_client_finish(&iter, client);
   if (r < 0) {
     return r;
@@ -243,14 +252,14 @@ int get_client(librados::IoCtx &ioctx, const std::string &oid,
 void get_client_start(librados::ObjectReadOperation *op,
                       const std::string &id) {
   bufferlist bl;
-  ::encode(id, bl);
+  encode(id, bl);
   op->exec("journal", "get_client", bl);
 }
 
-int get_client_finish(bufferlist::iterator *iter,
+int get_client_finish(bufferlist::const_iterator *iter,
                       cls::journal::Client *client) {
   try {
-    ::decode(*client, *iter);
+    decode(*client, *iter);
   } catch (const buffer::error &err) {
     return -EBADMSG;
   }
@@ -267,8 +276,8 @@ int client_register(librados::IoCtx &ioctx, const std::string &oid,
 void client_register(librados::ObjectWriteOperation *op,
                      const std::string &id, const bufferlist &data) {
   bufferlist bl;
-  ::encode(id, bl);
-  ::encode(data, bl);
+  encode(id, bl);
+  encode(data, bl);
   op->exec("journal", "client_register", bl);
 }
 
@@ -282,20 +291,25 @@ int client_update_data(librados::IoCtx &ioctx, const std::string &oid,
 void client_update_data(librados::ObjectWriteOperation *op,
                         const std::string &id, const bufferlist &data) {
   bufferlist bl;
-  ::encode(id, bl);
-  ::encode(data, bl);
+  encode(id, bl);
+  encode(data, bl);
   op->exec("journal", "client_update_data", bl);
 }
 
 int client_update_state(librados::IoCtx &ioctx, const std::string &oid,
                         const std::string &id, cls::journal::ClientState state) {
-  bufferlist bl;
-  ::encode(id, bl);
-  ::encode(static_cast<uint8_t>(state), bl);
-
   librados::ObjectWriteOperation op;
-  op.exec("journal", "client_update_state", bl);
+  client_update_state(&op, id, state);
   return ioctx.operate(oid, &op);
+}
+
+void client_update_state(librados::ObjectWriteOperation *op,
+                         const std::string &id,
+                         cls::journal::ClientState state) {
+  bufferlist bl;
+  encode(id, bl);
+  encode(static_cast<uint8_t>(state), bl);
+  op->exec("journal", "client_update_state", bl);
 }
 
 int client_unregister(librados::IoCtx &ioctx, const std::string &oid,
@@ -309,24 +323,29 @@ void client_unregister(librados::ObjectWriteOperation *op,
 		       const std::string &id) {
 
   bufferlist bl;
-  ::encode(id, bl);
+  encode(id, bl);
   op->exec("journal", "client_unregister", bl);
 }
 
 void client_commit(librados::ObjectWriteOperation *op, const std::string &id,
                    const cls::journal::ObjectSetPosition &commit_position) {
   bufferlist bl;
-  ::encode(id, bl);
-  ::encode(commit_position, bl);
+  encode(id, bl);
+  encode(commit_position, bl);
   op->exec("journal", "client_commit", bl);
 }
 
 int client_list(librados::IoCtx &ioctx, const std::string &oid,
                 std::set<cls::journal::Client> *clients) {
   C_SaferCond cond;
-  C_ClientList *client_list = new C_ClientList(ioctx, oid, clients, &cond);
-  client_list->send("");
+  client_list(ioctx, oid, clients, &cond);
   return cond.wait();
+}
+
+void client_list(librados::IoCtx &ioctx, const std::string &oid,
+                 std::set<cls::journal::Client> *clients, Context *on_finish) {
+  C_ClientList *client_list = new C_ClientList(ioctx, oid, clients, on_finish);
+  client_list->send("");
 }
 
 int get_next_tag_tid(librados::IoCtx &ioctx, const std::string &oid,
@@ -340,7 +359,7 @@ int get_next_tag_tid(librados::IoCtx &ioctx, const std::string &oid,
     return r;
   }
 
-  bufferlist::iterator iter = out_bl.begin();
+  auto iter = out_bl.cbegin();
   r = get_next_tag_tid_finish(&iter, tag_tid);
   if (r < 0) {
     return r;
@@ -353,10 +372,10 @@ void get_next_tag_tid_start(librados::ObjectReadOperation *op) {
   op->exec("journal", "get_next_tag_tid", bl);
 }
 
-int get_next_tag_tid_finish(bufferlist::iterator *iter,
+int get_next_tag_tid_finish(bufferlist::const_iterator *iter,
                             uint64_t *tag_tid) {
   try {
-    ::decode(*tag_tid, *iter);
+    decode(*tag_tid, *iter);
   } catch (const buffer::error &err) {
     return -EBADMSG;
   }
@@ -374,7 +393,7 @@ int get_tag(librados::IoCtx &ioctx, const std::string &oid,
     return r;
   }
 
-  bufferlist::iterator iter = out_bl.begin();
+  auto iter = out_bl.cbegin();
   r = get_tag_finish(&iter, tag);
   if (r < 0) {
     return r;
@@ -385,13 +404,13 @@ int get_tag(librados::IoCtx &ioctx, const std::string &oid,
 void get_tag_start(librados::ObjectReadOperation *op,
                    uint64_t tag_tid) {
   bufferlist bl;
-  ::encode(tag_tid, bl);
+  encode(tag_tid, bl);
   op->exec("journal", "get_tag", bl);
 }
 
-int get_tag_finish(bufferlist::iterator *iter, cls::journal::Tag *tag) {
+int get_tag_finish(bufferlist::const_iterator *iter, cls::journal::Tag *tag) {
   try {
-    ::decode(*tag, *iter);
+    decode(*tag, *iter);
   } catch (const buffer::error &err) {
     return -EBADMSG;
   }
@@ -409,9 +428,9 @@ int tag_create(librados::IoCtx &ioctx, const std::string &oid,
 void tag_create(librados::ObjectWriteOperation *op, uint64_t tag_tid,
                 uint64_t tag_class, const bufferlist &data) {
   bufferlist bl;
-  ::encode(tag_tid, bl);
-  ::encode(tag_class, bl);
-  ::encode(data, bl);
+  encode(tag_tid, bl);
+  encode(tag_class, bl);
+  encode(data, bl);
   op->exec("journal", "tag_create", bl);
 }
 
@@ -431,7 +450,7 @@ int tag_list(librados::IoCtx &ioctx, const std::string &oid,
       return r;
     }
 
-    bufferlist::iterator iter = out_bl.begin();
+    auto iter = out_bl.cbegin();
     std::set<cls::journal::Tag> decode_tags;
     r = tag_list_finish(&iter, &decode_tags);
     if (r < 0) {
@@ -451,17 +470,17 @@ void tag_list_start(librados::ObjectReadOperation *op,
                     const std::string &client_id,
                     boost::optional<uint64_t> tag_class) {
   bufferlist bl;
-  ::encode(start_after_tag_tid, bl);
-  ::encode(max_return, bl);
-  ::encode(client_id, bl);
-  ::encode(tag_class, bl);
+  encode(start_after_tag_tid, bl);
+  encode(max_return, bl);
+  encode(client_id, bl);
+  encode(tag_class, bl);
   op->exec("journal", "tag_list", bl);
 }
 
-int tag_list_finish(bufferlist::iterator *iter,
+int tag_list_finish(bufferlist::const_iterator *iter,
                     std::set<cls::journal::Tag> *tags) {
   try {
-    ::decode(*tags, *iter);
+    decode(*tags, *iter);
   } catch (const buffer::error &err) {
     return -EBADMSG;
   }
@@ -470,8 +489,17 @@ int tag_list_finish(bufferlist::iterator *iter,
 
 void guard_append(librados::ObjectWriteOperation *op, uint64_t soft_max_size) {
   bufferlist bl;
-  ::encode(soft_max_size, bl);
+  encode(soft_max_size, bl);
   op->exec("journal", "guard_append", bl);
+}
+
+void append(librados::ObjectWriteOperation *op, uint64_t soft_max_size,
+            bufferlist &data) {
+  bufferlist bl;
+  encode(soft_max_size, bl);
+  encode(data, bl);
+
+  op->exec("journal", "append", bl);
 }
 
 } // namespace client

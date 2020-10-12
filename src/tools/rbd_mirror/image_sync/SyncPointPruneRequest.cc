@@ -2,14 +2,15 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "SyncPointPruneRequest.h"
+#include "common/debug.h"
 #include "common/errno.h"
-#include "journal/Journaler.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/Operations.h"
 #include "librbd/Utils.h"
 #include <set>
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd::mirror::image_sync::SyncPointPruneRequest: " \
@@ -21,30 +22,32 @@ namespace image_sync {
 using librbd::util::create_context_callback;
 
 template <typename I>
-SyncPointPruneRequest<I>::SyncPointPruneRequest(I *remote_image_ctx,
-                                                bool sync_complete,
-                                                Journaler *journaler,
-                                                MirrorPeerClientMeta *client_meta,
-                                                Context *on_finish)
-  : m_remote_image_ctx(remote_image_ctx), m_sync_complete(sync_complete),
-    m_journaler(journaler), m_client_meta(client_meta), m_on_finish(on_finish),
-    m_client_meta_copy(*client_meta) {
+SyncPointPruneRequest<I>::SyncPointPruneRequest(
+    I *remote_image_ctx,
+    bool sync_complete,
+    SyncPointHandler* sync_point_handler,
+    Context *on_finish)
+  : m_remote_image_ctx(remote_image_ctx),
+    m_sync_complete(sync_complete),
+    m_sync_point_handler(sync_point_handler),
+    m_on_finish(on_finish) {
+  m_sync_points_copy = m_sync_point_handler->get_sync_points();
 }
 
 template <typename I>
 void SyncPointPruneRequest<I>::send() {
-  if (m_client_meta->sync_points.empty()) {
+  if (m_sync_points_copy.empty()) {
     send_remove_snap();
     return;
   }
 
   if (m_sync_complete) {
     // if sync is complete, we can remove the master sync point
-    auto it = m_client_meta_copy.sync_points.begin();
-    MirrorPeerSyncPoint &sync_point = *it;
+    auto it = m_sync_points_copy.begin();
+    auto& sync_point = *it;
 
     ++it;
-    if (it == m_client_meta_copy.sync_points.end() ||
+    if (it == m_sync_points_copy.end() ||
         it->from_snap_name != sync_point.snap_name) {
       m_snap_names.push_back(sync_point.snap_name);
     }
@@ -53,14 +56,27 @@ void SyncPointPruneRequest<I>::send() {
       m_snap_names.push_back(sync_point.from_snap_name);
     }
   } else {
-    // if we have more than one sync point, trim the extras off
+    // if we have more than one sync point or invalid sync points,
+    // trim them off
+    std::shared_lock image_locker{m_remote_image_ctx->image_lock};
     std::set<std::string> snap_names;
-    for (auto it = m_client_meta_copy.sync_points.rbegin();
-         it != m_client_meta_copy.sync_points.rend(); ++it) {
-      MirrorPeerSyncPoint &sync_point =
-        m_client_meta_copy.sync_points.back();
-      if (&sync_point == &m_client_meta_copy.sync_points.front()) {
-        break;
+    for (auto it = m_sync_points_copy.rbegin();
+         it != m_sync_points_copy.rend(); ++it) {
+      auto& sync_point = *it;
+      if (&sync_point == &m_sync_points_copy.front()) {
+        if (m_remote_image_ctx->get_snap_id(
+	      cls::rbd::UserSnapshotNamespace(), sync_point.snap_name) ==
+              CEPH_NOSNAP) {
+          derr << ": failed to locate sync point snapshot: "
+               << sync_point.snap_name << dendl;
+        } else if (!sync_point.from_snap_name.empty()) {
+          derr << ": unexpected from_snap_name in primary sync point: "
+               << sync_point.from_snap_name << dendl;
+        } else {
+          // first sync point is OK -- keep it
+          break;
+        }
+        m_invalid_master_sync_point = true;
       }
 
       if (snap_names.count(sync_point.snap_name) == 0) {
@@ -68,8 +84,7 @@ void SyncPointPruneRequest<I>::send() {
         m_snap_names.push_back(sync_point.snap_name);
       }
 
-      MirrorPeerSyncPoint &front_sync_point =
-        m_client_meta_copy.sync_points.front();
+      auto& front_sync_point = m_sync_points_copy.front();
       if (!sync_point.from_snap_name.empty() &&
           snap_names.count(sync_point.from_snap_name) == 0 &&
           sync_point.from_snap_name != front_sync_point.snap_name) {
@@ -91,21 +106,21 @@ void SyncPointPruneRequest<I>::send_remove_snap() {
 
   const std::string &snap_name = m_snap_names.front();
 
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << ": snap_name=" << snap_name << dendl;
+  dout(20) << ": snap_name=" << snap_name << dendl;
 
   Context *ctx = create_context_callback<
     SyncPointPruneRequest<I>, &SyncPointPruneRequest<I>::handle_remove_snap>(
       this);
-  m_remote_image_ctx->operations->snap_remove(snap_name.c_str(), ctx);
+  m_remote_image_ctx->operations->snap_remove(cls::rbd::UserSnapshotNamespace(),
+					      snap_name.c_str(),
+					      ctx);
 }
 
 template <typename I>
 void SyncPointPruneRequest<I>::handle_remove_snap(int r) {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << ": r=" << r << dendl;
+  dout(20) << ": r=" << r << dendl;
 
-  assert(!m_snap_names.empty());
+  ceph_assert(!m_snap_names.empty());
   std::string snap_name = m_snap_names.front();
   m_snap_names.pop_front();
 
@@ -113,8 +128,8 @@ void SyncPointPruneRequest<I>::handle_remove_snap(int r) {
     r = 0;
   }
   if (r < 0) {
-    lderr(cct) << ": failed to remove snapshot '" << snap_name << "': "
-               << cpp_strerror(r) << dendl;
+    derr << ": failed to remove snapshot '" << snap_name << "': "
+         << cpp_strerror(r) << dendl;
     finish(r);
     return;
   }
@@ -124,8 +139,7 @@ void SyncPointPruneRequest<I>::handle_remove_snap(int r) {
 
 template <typename I>
 void SyncPointPruneRequest<I>::send_refresh_image() {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << dendl;
+  dout(20) << dendl;
 
   Context *ctx = create_context_callback<
     SyncPointPruneRequest<I>, &SyncPointPruneRequest<I>::handle_refresh_image>(
@@ -135,65 +149,58 @@ void SyncPointPruneRequest<I>::send_refresh_image() {
 
 template <typename I>
 void SyncPointPruneRequest<I>::handle_refresh_image(int r) {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << ": r=" << r << dendl;
+  dout(20) << ": r=" << r << dendl;
 
   if (r < 0) {
-    lderr(cct) << ": remote image refresh failed: " << cpp_strerror(r) << dendl;
+    derr << ": remote image refresh failed: " << cpp_strerror(r) << dendl;
     finish(r);
     return;
   }
 
-  send_update_client();
+  send_update_sync_points();
 }
 
 template <typename I>
-void SyncPointPruneRequest<I>::send_update_client() {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << dendl;
+void SyncPointPruneRequest<I>::send_update_sync_points() {
+  dout(20) << dendl;
 
   if (m_sync_complete) {
-    m_client_meta_copy.sync_points.pop_front();
-    if (m_client_meta_copy.sync_points.empty()) {
-      m_client_meta_copy.state = librbd::journal::MIRROR_PEER_STATE_REPLAYING;
-    }
+    m_sync_points_copy.pop_front();
   } else {
-    while (m_client_meta_copy.sync_points.size() > 1) {
-      m_client_meta_copy.sync_points.pop_back();
+    while (m_sync_points_copy.size() > 1) {
+      m_sync_points_copy.pop_back();
+    }
+    if (m_invalid_master_sync_point) {
+      // all subsequent sync points would have been pruned
+      m_sync_points_copy.clear();
     }
   }
 
-  bufferlist client_data_bl;
-  librbd::journal::ClientData client_data(m_client_meta_copy);
-  ::encode(client_data, client_data_bl);
-
-  Context *ctx = create_context_callback<
-    SyncPointPruneRequest<I>, &SyncPointPruneRequest<I>::handle_update_client>(
-      this);
-  m_journaler->update_client(client_data_bl, ctx);
+  auto ctx = create_context_callback<
+    SyncPointPruneRequest<I>,
+    &SyncPointPruneRequest<I>::handle_update_sync_points>(this);
+  m_sync_point_handler->update_sync_points(
+    m_sync_point_handler->get_snap_seqs(), m_sync_points_copy,
+    m_sync_complete, ctx);
 }
 
 template <typename I>
-void SyncPointPruneRequest<I>::handle_update_client(int r) {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << ": r=" << r << dendl;
+void SyncPointPruneRequest<I>::handle_update_sync_points(int r) {
+  dout(20) << ": r=" << r << dendl;
 
   if (r < 0) {
-    lderr(cct) << ": failed to update client data: " << cpp_strerror(r)
-               << dendl;
+    derr << ": failed to update client data: " << cpp_strerror(r)
+         << dendl;
     finish(r);
     return;
   }
 
-  // update provided meta structure to reflect reality
-  *m_client_meta = m_client_meta_copy;
   finish(0);
 }
 
 template <typename I>
 void SyncPointPruneRequest<I>::finish(int r) {
-  CephContext *cct = m_remote_image_ctx->cct;
-  ldout(cct, 20) << ": r=" << r << dendl;
+  dout(20) << ": r=" << r << dendl;
 
   m_on_finish->complete(r);
   delete this;

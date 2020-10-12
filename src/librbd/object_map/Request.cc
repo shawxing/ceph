@@ -2,13 +2,10 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/object_map/Request.h"
-#include "include/rados/librados.hpp"
-#include "include/rbd/librbd.hpp"
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/RWLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/ImageWatcher.h"
 #include "librbd/object_map/InvalidateRequest.h"
 
 #define dout_subsys ceph_subsys_rbd
@@ -25,16 +22,17 @@ bool Request::should_complete(int r) {
   switch (m_state)
   {
   case STATE_REQUEST:
-    if (r < 0) {
+    if (r == -ETIMEDOUT &&
+        !cct->_conf.get_val<bool>("rbd_invalidate_object_map_on_timeout")) {
+      m_state = STATE_TIMEOUT;
+      return true;
+    } else if (r < 0) {
       lderr(cct) << "failed to update object map: " << cpp_strerror(r)
 		 << dendl;
       return invalidate();
     }
 
-    {
-      RWLock::WLocker l2(m_image_ctx.object_map_lock);
-      finish_request();
-    }
+    finish_request();
     return true;
 
   case STATE_INVALIDATE:
@@ -47,21 +45,24 @@ bool Request::should_complete(int r) {
 
   default:
     lderr(cct) << "invalid state: " << m_state << dendl;
-    assert(false);
+    ceph_abort();
     break;
   }
   return false;
 }
 
 bool Request::invalidate() {
-  if (m_image_ctx.test_flags(RBD_FLAG_OBJECT_MAP_INVALID)) {
+  bool flags_set;
+  int r = m_image_ctx.test_flags(m_snap_id, RBD_FLAG_OBJECT_MAP_INVALID,
+                                 &flags_set);
+  if (r < 0 || flags_set) {
     return true;
   }
 
   m_state = STATE_INVALIDATE;
 
-  RWLock::RLocker owner_locker(m_image_ctx.owner_lock);
-  RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+  std::shared_lock owner_locker{m_image_ctx.owner_lock};
+  std::unique_lock image_locker{m_image_ctx.image_lock};
   InvalidateRequest<> *req = new InvalidateRequest<>(m_image_ctx, m_snap_id,
                                                      true,
                                                      create_callback_context());

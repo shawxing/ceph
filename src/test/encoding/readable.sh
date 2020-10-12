@@ -1,12 +1,11 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+set -e
 
 source $(dirname $0)/../detect-build-env-vars.sh
 
 [ -z "$CEPH_ROOT" ] && CEPH_ROOT=..
 
 dir=$CEPH_ROOT/ceph-object-corpus
-
-set -e
 
 failed=0
 numtests=0
@@ -29,8 +28,8 @@ test_object() {
     local failed=0
     local numtests=0
 
-    tmp1=`mktemp /tmp/typ-XXXXXXXXX`
-    tmp2=`mktemp /tmp/typ-XXXXXXXXX`
+    tmp1=`mktemp /tmp/test_object_1-XXXXXXXXX`
+    tmp2=`mktemp /tmp/test_object_2-XXXXXXXXX`
 
     rm -f $output_file
     if $CEPH_DENCODER type $type 2>/dev/null; then
@@ -41,7 +40,7 @@ test_object() {
       incompat=""
       incompat_paths=""
       sawarversion=0
-      for iv in `ls -v $dir/archive`; do
+      for iv in `ls $dir/archive | sort -n`; do
         if [ "$iv" = "$arversion" ]; then
           sawarversion=1
         fi
@@ -53,7 +52,7 @@ test_object() {
           # all paths for this type into variable. Assuming that this path won't contain any
           # whitechars (implication of above for loop).
           if [ -d "$dir/archive/$iv/forward_incompat/$type" ]; then
-            if [ -n "`ls -v $dir/archive/$iv/forward_incompat/$type/`" ]; then
+            if [ -n "`ls $dir/archive/$iv/forward_incompat/$type/ | sort -n`" ]; then
               incompat_paths="$incompat_paths $dir/archive/$iv/forward_incompat/$type"
             else
               echo "type $type directory empty, ignoring whole type instead of single objects"
@@ -62,6 +61,7 @@ test_object() {
         fi
 
         if [ "$iv" = "$version" ]; then
+          rm -rf $tmp1 $tmp2
           break
         fi
       done
@@ -69,7 +69,8 @@ test_object() {
       if [ -n "$incompat" ]; then
         if [ -z "$incompat_paths" ]; then
           echo "skipping incompat $type version $arversion, changed at $incompat < code $myversion"
-          continue
+          rm -rf $tmp1 $tmp2
+	  return
         else
           # If we are ignoring not whole type, but objects that are in $incompat_path,
           # we don't skip here, just give info.
@@ -132,14 +133,15 @@ test_object() {
           failed=$(($failed + 1))
         fi
         numtests=$(($numtests + 1))
-        echo "failed=$failed" > $output_file
-        echo "numtests=$numtests" >> $output_file
+	rm -f $tmp1 $tmp2
       done
     else
       echo "skipping unrecognized type $type"
+      rm -f $tmp1 $tmp2
     fi
 
-    rm -f $tmp1 $tmp2
+    echo "failed=$failed" > $output_file
+    echo "numtests=$numtests" >> $output_file
 }
 
 waitall() { # PID...
@@ -169,29 +171,7 @@ waitall() { # PID...
 # MAIN
 ######
 
-# Using $MAX_PARALLEL_JOBS jobs if defined, unless the number of logical
-# processors
-max_parallel_jobs=${MAX_PARALLEL_JOBS:-$(nproc)}
-
-for arversion in `ls -v $dir/archive`; do
-  vdir="$dir/archive/$arversion"
-  #echo $vdir
-
-  if [ ! -d "$vdir/objects" ]; then
-    continue;
-  fi
-
-  output_file=`mktemp /tmp/typ-XXXXXXXXX`
-  running_jobs=0
-  for type in `ls $vdir/objects`; do
-    test_object $type $output_file.$running_jobs &
-    pids="$pids $!"
-    running_jobs=$(($running_jobs + 1))
-
-    # Once we spawned enough jobs, let's wait them to complete
-    # Every spawned job have almost the same execution time so
-    # it's not a big deal having them not ending at the same time
-    if [ "$running_jobs" -eq "$max_parallel_jobs" ]; then
+do_join() {
         waitall $pids
         pids=""
         # Reading the output of jobs to compute failed & numtests
@@ -208,13 +188,54 @@ for arversion in `ls -v $dir/archive`; do
             running_jobs=$(($running_jobs - 1))
         done
         running_jobs=0
+}
+
+# Using $MAX_PARALLEL_JOBS jobs if defined, unless the number of logical
+# processors
+if [ `uname` == FreeBSD -o `uname` == Darwin ]; then
+  NPROC=`sysctl -n hw.ncpu`
+  max_parallel_jobs=${MAX_PARALLEL_JOBS:-${NPROC}}
+else
+  max_parallel_jobs=${MAX_PARALLEL_JOBS:-$(nproc)}
+fi
+
+output_file=`mktemp /tmp/output_file-XXXXXXXXX`
+running_jobs=0
+
+for arversion in `ls $dir/archive | sort -n`; do
+  vdir="$dir/archive/$arversion"
+  #echo $vdir
+
+  if [ ! -d "$vdir/objects" ]; then
+    continue;
+  fi
+
+  for type in `ls $vdir/objects`; do
+    test_object $type $output_file.$running_jobs &
+    pids="$pids $!"
+    running_jobs=$(($running_jobs + 1))
+
+    # Once we spawned enough jobs, let's wait them to complete
+    # Every spawned job have almost the same execution time so
+    # it's not a big deal having them not ending at the same time
+    if [ "$running_jobs" -eq "$max_parallel_jobs" ]; then
+	do_join
     fi
+    rm -f ${output_file}*
   done
 done
+
+do_join
 
 if [ $failed -gt 0 ]; then
   echo "FAILED $failed / $numtests tests."
   exit 1
 fi
+
+if [ $numtests -eq 0 ]; then
+  echo "FAILED: no tests found to run!"
+  exit 1
+fi
+
 echo "passed $numtests tests."
 

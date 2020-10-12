@@ -47,16 +47,16 @@ public:
                           Context *on_finish)
     : Request(image_ctx, CEPH_NOSNAP, on_finish),
       m_snap_id(snap_id), m_ret_val(0) {
-    assert(snap_id != CEPH_NOSNAP);
+    ceph_assert(snap_id != CEPH_NOSNAP);
   }
 
-  virtual void send();
+  void send() override;
 
 protected:
-  virtual bool should_complete(int r);
+  bool should_complete(int r) override;
 
 private:
-  State m_state;
+  State m_state = STATE_READ_MAP;
   uint64_t m_snap_id;
   int m_ret_val;
 

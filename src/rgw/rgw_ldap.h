@@ -1,8 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #ifndef RGW_LDAP_H
 #define RGW_LDAP_H
+
+#include "acconfig.h"
 
 #if defined(HAVE_OPENLDAP)
 #define LDAP_DEPRECATED 1
@@ -14,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <mutex>
 
 namespace rgw {
 
@@ -23,69 +26,76 @@ namespace rgw {
   {
     std::string uri;
     std::string binddn;
+    std::string bindpw;
     std::string searchdn;
+    std::string searchfilter;
     std::string dnattr;
     LDAP *ldap;
+    bool msad = false; /* TODO: possible future specialization */
+    std::mutex mtx;
 
   public:
-    LDAPHelper(std::string _uri, std::string _binddn, std::string _searchdn,
-	      std::string _dnattr)
-      : uri(std::move(_uri)), binddn(std::move(_binddn)), searchdn(_searchdn),
-	dnattr(_dnattr), ldap(nullptr) {
+    using lock_guard = std::lock_guard<std::mutex>;
+
+    LDAPHelper(std::string _uri, std::string _binddn, std::string _bindpw,
+	       const std::string &_searchdn, const std::string &_searchfilter, const std::string &_dnattr)
+      : uri(std::move(_uri)), binddn(std::move(_binddn)),
+	bindpw(std::move(_bindpw)), searchdn(_searchdn), searchfilter(_searchfilter), dnattr(_dnattr),
+	ldap(nullptr) {
       // nothing
     }
 
     int init() {
       int ret;
       ret = ldap_initialize(&ldap, uri.c_str());
+      if (ret == LDAP_SUCCESS) {
+	unsigned long ldap_ver = LDAP_VERSION3;
+	ret = ldap_set_option(ldap, LDAP_OPT_PROTOCOL_VERSION,
+			      (void*) &ldap_ver);
+      }
+      if (ret == LDAP_SUCCESS) {
+	ret = ldap_set_option(ldap, LDAP_OPT_REFERRALS, LDAP_OPT_OFF); 
+      }
       return (ret == LDAP_SUCCESS) ? ret : -EINVAL;
     }
 
     int bind() {
       int ret;
-      ret = ldap_simple_bind_s(ldap, nullptr, nullptr);
+      ret = ldap_simple_bind_s(ldap, binddn.c_str(), bindpw.c_str());
       return (ret == LDAP_SUCCESS) ? ret : -EINVAL;
+    }
+
+    int rebind() {
+      if (ldap) {
+	(void) ldap_unbind(ldap);
+	(void) init();
+	return bind();
+      }
+      return -EINVAL;
     }
 
     int simple_bind(const char *dn, const std::string& pwd) {
       LDAP* tldap;
       int ret = ldap_initialize(&tldap, uri.c_str());
-      ret = ldap_simple_bind_s(tldap, dn, pwd.c_str());
       if (ret == LDAP_SUCCESS) {
-	ldap_unbind(tldap);
+	unsigned long ldap_ver = LDAP_VERSION3;
+	ret = ldap_set_option(tldap, LDAP_OPT_PROTOCOL_VERSION,
+			      (void*) &ldap_ver);
+	if (ret == LDAP_SUCCESS) {
+	  ret = ldap_simple_bind_s(tldap, dn, pwd.c_str());
+	  if (ret == LDAP_SUCCESS) {
+	    (void) ldap_unbind(tldap);
+	  }
+	}
       }
       return ret; // OpenLDAP client error space
     }
 
-    int auth(const std::string uid, const std::string pwd) {
-      int ret;
-      std::string filter;
-      filter = "(";
-      filter += dnattr;
-      filter += "=";
-      filter += uid;
-      filter += ")";
-      char *attrs[] = { const_cast<char*>(dnattr.c_str()), nullptr };
-      LDAPMessage *answer = nullptr, *entry = nullptr;
-      ret = ldap_search_s(ldap, searchdn.c_str(), LDAP_SCOPE_SUBTREE,
-			  filter.c_str(), attrs, 0, &answer);
-      if (ret == LDAP_SUCCESS) {
-	entry = ldap_first_entry(ldap, answer);
-	if (entry) {
-	  char *dn = ldap_get_dn(ldap, entry);
-	  ret = simple_bind(dn, pwd);
-	  ldap_memfree(dn);
-	} else {
-	  ret = LDAP_NO_SUCH_ATTRIBUTE; // fixup result
-	}
-	ldap_msgfree(answer);
-      }
-      return (ret == LDAP_SUCCESS) ? ret : -EACCES;
-    }
+    int auth(const std::string &uid, const std::string &pwd);
 
     ~LDAPHelper() {
       if (ldap)
-	ldap_unbind(ldap);
+	(void) ldap_unbind(ldap);
     }
 
   }; /* LDAPHelper */
@@ -95,8 +105,8 @@ namespace rgw {
   class LDAPHelper
   {
   public:
-    LDAPHelper(std::string _uri, std::string _binddn, std::string _searchdn,
-	      std::string _dnattr)
+    LDAPHelper(const std::string &_uri, const std::string &_binddn, const std::string &_bindpw,
+	       const std::string &_searchdn, const std::string &_searchfilter, const std::string &_dnattr)
       {}
 
     int init() {
@@ -107,7 +117,7 @@ namespace rgw {
       return -ENOTSUP;
     }
 
-    int auth(const std::string uid, const std::string pwd) {
+    int auth(const std::string &uid, const std::string &pwd) {
       return -EACCES;
     }
 
@@ -117,7 +127,17 @@ namespace rgw {
 
 
 #endif /* HAVE_OPENLDAP */
-
+  
 } /* namespace rgw */
+
+#include "common/ceph_context.h"
+#include "common/common_init.h"
+#include "common/dout.h"
+#include "common/safe_io.h"
+#include <boost/algorithm/string.hpp>
+
+#include "include/ceph_assert.h"
+
+std::string parse_rgw_ldap_bindpw(CephContext* ctx);
 
 #endif /* RGW_LDAP_H */

@@ -7,27 +7,25 @@
 #include "include/int_types.h"
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
+#include "common/AsyncOpTracker.h"
 #include "common/Cond.h"
-#include "common/Mutex.h"
+#include "common/ceph_mutex.h"
 #include "common/RefCountedObj.h"
 #include "common/WorkQueue.h"
 #include "cls/journal/cls_journal_types.h"
-#include "journal/AsyncOpTracker.h"
-#include <boost/intrusive_ptr.hpp>
+#include "journal/JournalMetadataListener.h"
+#include "journal/Settings.h"
 #include <boost/noncopyable.hpp>
 #include <boost/optional.hpp>
 #include <functional>
 #include <list>
 #include <map>
 #include <string>
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 class SafeTimer;
 
 namespace journal {
-
-class JournalMetadata;
-typedef boost::intrusive_ptr<JournalMetadata> JournalMetadataPtr;
 
 class JournalMetadata : public RefCountedObject, boost::noncopyable {
 public:
@@ -41,16 +39,6 @@ public:
   typedef std::set<Client> RegisteredClients;
   typedef std::list<Tag> Tags;
 
-  struct Listener {
-    virtual ~Listener() {};
-    virtual void handle_update(JournalMetadata *) = 0;
-  };
-
-  JournalMetadata(ContextWQ *work_queue, SafeTimer *timer, Mutex *timer_lock,
-                  librados::IoCtx &ioctx, const std::string &oid,
-                  const std::string &client_id, double commit_interval);
-  ~JournalMetadata();
-
   void init(Context *on_init);
   void shut_down(Context *on_finish);
 
@@ -62,8 +50,8 @@ public:
   void get_mutable_metadata(uint64_t *minimum_set, uint64_t *active_set,
 			    RegisteredClients *clients, Context *on_finish);
 
-  void add_listener(Listener *listener);
-  void remove_listener(Listener *listener);
+  void add_listener(JournalMetadataListener *listener);
+  void remove_listener(JournalMetadataListener *listener);
 
   void register_client(const bufferlist &data, Context *on_finish);
   void update_client(const bufferlist &data, Context *on_finish);
@@ -74,9 +62,13 @@ public:
   void allocate_tag(uint64_t tag_class, const bufferlist &data,
                     Tag *tag, Context *on_finish);
   void get_tag(uint64_t tag_tid, Tag *tag, Context *on_finish);
-  void get_tags(const boost::optional<uint64_t> &tag_class, Tags *tags,
+  void get_tags(uint64_t start_after_tag_tid,
+                const boost::optional<uint64_t> &tag_class, Tags *tags,
                 Context *on_finish);
 
+  inline const Settings &get_settings() const {
+    return m_settings;
+  }
   inline const std::string &get_client_id() const {
     return m_client_id;
   }
@@ -97,23 +89,27 @@ public:
     m_work_queue->queue(on_finish, r);
   }
 
+  inline ContextWQ *get_work_queue() {
+    return m_work_queue;
+  }
+
   inline SafeTimer &get_timer() {
     return *m_timer;
   }
-  inline Mutex &get_timer_lock() {
+  inline ceph::mutex &get_timer_lock() {
     return *m_timer_lock;
   }
 
   void set_minimum_set(uint64_t object_set);
   inline uint64_t get_minimum_set() const {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     return m_minimum_set;
   }
 
   int set_active_set(uint64_t object_set);
   void set_active_set(uint64_t object_set, Context *on_finish);
   inline uint64_t get_active_set() const {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     return m_active_set;
   }
 
@@ -122,17 +118,17 @@ public:
   void flush_commit_position();
   void flush_commit_position(Context *on_safe);
   void get_commit_position(ObjectSetPosition *commit_position) const {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     *commit_position = m_client.commit_position;
   }
 
   void get_registered_clients(RegisteredClients *registered_clients) {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     *registered_clients = m_registered_clients;
   }
 
   inline uint64_t allocate_entry_tid(uint64_t tag_tid) {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     return m_allocated_entry_tids[tag_tid]++;
   }
   void reserve_entry_tid(uint64_t tag_tid, uint64_t entry_tid);
@@ -146,11 +142,20 @@ public:
   void committed(uint64_t commit_tid, const CreateContext &create_context);
 
   void notify_update();
-  void async_notify_update();
+  void async_notify_update(Context *on_safe);
+
+  void wait_for_ops();
 
 private:
+  FRIEND_MAKE_REF(JournalMetadata);
+  JournalMetadata(ContextWQ *work_queue, SafeTimer *timer, ceph::mutex *timer_lock,
+                  librados::IoCtx &ioctx, const std::string &oid,
+                  const std::string &client_id, const Settings &settings);
+  ~JournalMetadata() override;
+
   typedef std::map<uint64_t, uint64_t> AllocatedEntryTids;
-  typedef std::list<Listener*> Listeners;
+  typedef std::list<JournalMetadataListener*> Listeners;
+  typedef std::list<Context*> Contexts;
 
   struct CommitEntry {
     uint64_t object_num;
@@ -173,11 +178,11 @@ private:
     C_WatchCtx(JournalMetadata *_journal_metadata)
       : journal_metadata(_journal_metadata) {}
 
-    virtual void handle_notify(uint64_t notify_id, uint64_t cookie,
-                               uint64_t notifier_id, bufferlist& bl) {
+    void handle_notify(uint64_t notify_id, uint64_t cookie,
+                               uint64_t notifier_id, bufferlist& bl) override {
       journal_metadata->handle_watch_notify(notify_id, cookie);
     }
-    virtual void handle_error(uint64_t cookie, int err) {
+    void handle_error(uint64_t cookie, int err) override {
       journal_metadata->handle_watch_error(err);
     }
   };
@@ -189,10 +194,10 @@ private:
       : journal_metadata(_journal_metadata) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_WatchReset() {
+    ~C_WatchReset() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_watch_reset();
     }
   };
@@ -204,27 +209,31 @@ private:
       : journal_metadata(_journal_metadata) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_CommitPositionTask() {
+    ~C_CommitPositionTask() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
-      Mutex::Locker locker(journal_metadata->m_lock);
+    void finish(int r) override {
+      std::lock_guard locker{journal_metadata->m_lock};
       journal_metadata->handle_commit_position_task();
     };
   };
 
   struct C_AioNotify : public Context {
     JournalMetadata* journal_metadata;
+    Context *on_safe;
 
-    C_AioNotify(JournalMetadata *_journal_metadata)
-      : journal_metadata(_journal_metadata) {
+    C_AioNotify(JournalMetadata *_journal_metadata, Context *_on_safe)
+      : journal_metadata(_journal_metadata), on_safe(_on_safe) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_AioNotify() {
+    ~C_AioNotify() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_notified(r);
+      if (on_safe != nullptr) {
+        on_safe->complete(0);
+      }
     }
   };
 
@@ -236,12 +245,13 @@ private:
       : journal_metadata(_journal_metadata), on_safe(_on_safe) {
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_NotifyUpdate() {
+    ~C_NotifyUpdate() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       if (r == 0) {
-        journal_metadata->async_notify_update();
+        journal_metadata->async_notify_update(on_safe);
+        return;
       }
       if (on_safe != NULL) {
         on_safe->complete(r);
@@ -255,13 +265,13 @@ private:
 
     C_ImmutableMetadata(JournalMetadata *_journal_metadata, Context *_on_finish)
       : journal_metadata(_journal_metadata), on_finish(_on_finish) {
-      Mutex::Locker locker(journal_metadata->m_lock);
+      std::lock_guard locker{journal_metadata->m_lock};
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_ImmutableMetadata() {
+    ~C_ImmutableMetadata() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_immutable_metadata(r, on_finish);
     }
   };
@@ -271,61 +281,66 @@ private:
     uint64_t minimum_set;
     uint64_t active_set;
     RegisteredClients registered_clients;
-    Context *on_finish;
 
-    C_Refresh(JournalMetadata *_journal_metadata, Context *_on_finish)
-      : journal_metadata(_journal_metadata), minimum_set(0), active_set(0),
-        on_finish(_on_finish) {
-      Mutex::Locker locker(journal_metadata->m_lock);
+    C_Refresh(JournalMetadata *_journal_metadata)
+      : journal_metadata(_journal_metadata), minimum_set(0), active_set(0) {
+      std::lock_guard locker{journal_metadata->m_lock};
       journal_metadata->m_async_op_tracker.start_op();
     }
-    virtual ~C_Refresh() {
+    ~C_Refresh() override {
       journal_metadata->m_async_op_tracker.finish_op();
     }
-    virtual void finish(int r) {
+    void finish(int r) override {
       journal_metadata->handle_refresh_complete(this, r);
     }
   };
 
   librados::IoCtx m_ioctx;
-  CephContext *m_cct;
+  CephContext *m_cct = nullptr;
   std::string m_oid;
   std::string m_client_id;
-  double m_commit_interval;
+  Settings m_settings;
 
-  uint8_t m_order;
-  uint8_t m_splay_width;
-  int64_t m_pool_id;
-  bool m_initialized;
+  uint8_t m_order = 0;
+  uint8_t m_splay_width = 0;
+  int64_t m_pool_id = -1;
+  bool m_initialized = false;
 
   ContextWQ *m_work_queue;
   SafeTimer *m_timer;
-  Mutex *m_timer_lock;
+  ceph::mutex *m_timer_lock;
 
-  mutable Mutex m_lock;
+  mutable ceph::mutex m_lock = ceph::make_mutex("JournalMetadata::m_lock");
 
-  uint64_t m_commit_tid;
+  uint64_t m_commit_tid = 0;
   CommitTids m_pending_commit_tids;
 
   Listeners m_listeners;
 
   C_WatchCtx m_watch_ctx;
-  uint64_t m_watch_handle;
+  uint64_t m_watch_handle = 0;
 
-  uint64_t m_minimum_set;
-  uint64_t m_active_set;
+  uint64_t m_minimum_set = 0;
+  uint64_t m_active_set = 0;
   RegisteredClients m_registered_clients;
   Client m_client;
 
   AllocatedEntryTids m_allocated_entry_tids;
 
-  size_t m_update_notifications;
-  Cond m_update_cond;
+  size_t m_update_notifications = 0;
+  ceph::condition_variable m_update_cond;
+
+  size_t m_ignore_watch_notifies = 0;
+  size_t m_refreshes_in_progress = 0;
+  Contexts m_refresh_ctxs;
 
   uint64_t m_commit_position_tid = 0;
   ObjectSetPosition m_commit_position;
-  Context *m_commit_position_ctx;
-  Context *m_commit_position_task_ctx;
+  Context *m_commit_position_ctx = nullptr;
+  Context *m_commit_position_task_ctx = nullptr;
+
+  size_t m_flush_commits_in_progress = 0;
+  Contexts m_flush_commit_position_ctxs;
 
   AsyncOpTracker m_async_op_tracker;
 
@@ -343,6 +358,8 @@ private:
   void handle_watch_notify(uint64_t notify_id, uint64_t cookie);
   void handle_watch_error(int err);
   void handle_notified(int r);
+
+  void schedule_laggy_clients_disconnect(Context *on_finish);
 
   friend std::ostream &operator<<(std::ostream &os,
 				  const JournalMetadata &journal_metadata);

@@ -3,19 +3,19 @@
 
 #include "StupidAllocator.h"
 #include "bluestore_types.h"
-#include "BlueStore.h"
+#include "common/debug.h"
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_bluestore
 #undef dout_prefix
-#define dout_prefix *_dout << "stupidalloc "
+#define dout_prefix *_dout << "stupidalloc 0x" << this << " "
 
-StupidAllocator::StupidAllocator()
-  : num_free(0),
-    num_uncommitted(0),
-    num_committing(0),
-    num_reserved(0),
-    free(10),
-    last_alloc(0)
+StupidAllocator::StupidAllocator(CephContext* cct,
+                                 const std::string& name,
+                                 int64_t _block_size)
+  : Allocator(name), cct(cct), num_free(0),
+    block_size(_block_size),
+    free(10)
 {
 }
 
@@ -25,55 +25,34 @@ StupidAllocator::~StupidAllocator()
 
 unsigned StupidAllocator::_choose_bin(uint64_t orig_len)
 {
-  uint64_t len = orig_len / g_conf->bluestore_min_alloc_size;
-  int bin = 0;
-  while (len && bin + 1 < (int)free.size()) {
-    len >>= 1;
-    bin++;
-  }
-  dout(30) << __func__ << " len " << orig_len << " -> " << bin << dendl;
+  uint64_t len = orig_len / cct->_conf->bdev_block_size;
+  int bin = std::min((int)cbits(len), (int)free.size() - 1);
+  ldout(cct, 30) << __func__ << " len 0x" << std::hex << orig_len
+		 << std::dec << " -> " << bin << dendl;
   return bin;
 }
 
 void StupidAllocator::_insert_free(uint64_t off, uint64_t len)
 {
   unsigned bin = _choose_bin(len);
-  dout(30) << __func__ << " " << off << "~" << len << " in bin " << bin << dendl;
+  ldout(cct, 30) << __func__ << " 0x" << std::hex << off << "~" << len
+		 << std::dec << " in bin " << bin << dendl;
   while (true) {
     free[bin].insert(off, len, &off, &len);
     unsigned newbin = _choose_bin(len);
     if (newbin == bin)
       break;
-    dout(30) << __func__ << " promoting " << off << "~" << len
-	     << " to bin " << newbin << dendl;
+    ldout(cct, 30) << __func__ << " promoting 0x" << std::hex << off << "~" << len
+		   << std::dec << " to bin " << newbin << dendl;
     free[bin].erase(off, len);
     bin = newbin;
   }
 }
 
-int StupidAllocator::reserve(uint64_t need)
-{
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " need " << need << " num_free " << num_free
-	   << " num_reserved " << num_reserved << dendl;
-  if ((int64_t)need > num_free - num_reserved)
-    return -ENOSPC;
-  num_reserved += need;
-  return 0;
-}
-
-void StupidAllocator::unreserve(uint64_t unused)
-{
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " unused " << unused << " num_free " << num_free
-	   << " num_reserved " << num_reserved << dendl;
-  assert(num_reserved >= (int64_t)unused);
-  num_reserved -= unused;
-}
-
 /// return the effective length of the extent if we align to alloc_unit
-static uint64_t aligned_len(btree_interval_set<uint64_t>::iterator p,
-			    uint64_t alloc_unit)
+uint64_t StupidAllocator::_aligned_len(
+  StupidAllocator::interval_set_t::iterator p,
+  uint64_t alloc_unit)
 {
   uint64_t skew = p.get_start() % alloc_unit;
   if (skew)
@@ -84,16 +63,16 @@ static uint64_t aligned_len(btree_interval_set<uint64_t>::iterator p,
     return p.get_len() - skew;
 }
 
-int StupidAllocator::allocate(
+int64_t StupidAllocator::allocate_int(
   uint64_t want_size, uint64_t alloc_unit, int64_t hint,
   uint64_t *offset, uint32_t *length)
 {
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " want_size " << want_size
-	   << " alloc_unit " << alloc_unit
-	   << " hint " << hint
-	   << dendl;
-  uint64_t want = MAX(alloc_unit, want_size);
+  std::lock_guard l(lock);
+  ldout(cct, 10) << __func__ << " want_size 0x" << std::hex << want_size
+	   	 << " alloc_unit 0x" << alloc_unit
+	   	 << " hint 0x" << hint << std::dec
+	   	 << dendl;
+  uint64_t want = std::max(alloc_unit, want_size);
   int bin = _choose_bin(want);
   int orig_bin = bin;
 
@@ -107,7 +86,7 @@ int StupidAllocator::allocate(
     for (bin = orig_bin; bin < (int)free.size(); ++bin) {
       p = free[bin].lower_bound(hint);
       while (p != free[bin].end()) {
-	if (aligned_len(p, alloc_unit) >= want_size) {
+	if (_aligned_len(p, alloc_unit) >= want_size) {
 	  goto found;
 	}
 	++p;
@@ -120,7 +99,7 @@ int StupidAllocator::allocate(
     p = free[bin].begin();
     auto end = hint ? free[bin].lower_bound(hint) : free[bin].end();
     while (p != end) {
-      if (aligned_len(p, alloc_unit) >= want_size) {
+      if (_aligned_len(p, alloc_unit) >= want_size) {
 	goto found;
       }
       ++p;
@@ -132,7 +111,7 @@ int StupidAllocator::allocate(
     for (bin = orig_bin; bin >= 0; --bin) {
       p = free[bin].lower_bound(hint);
       while (p != free[bin].end()) {
-	if (aligned_len(p, alloc_unit) >= alloc_unit) {
+	if (_aligned_len(p, alloc_unit) >= alloc_unit) {
 	  goto found;
 	}
 	++p;
@@ -145,14 +124,13 @@ int StupidAllocator::allocate(
     p = free[bin].begin();
     auto end = hint ? free[bin].lower_bound(hint) : free[bin].end();
     while (p != end) {
-      if (aligned_len(p, alloc_unit) >= alloc_unit) {
+      if (_aligned_len(p, alloc_unit) >= alloc_unit) {
 	goto found;
       }
       ++p;
     }
   }
 
-  assert(0 == "caller didn't reserve?");
   return -ENOSPC;
 
  found:
@@ -160,26 +138,28 @@ int StupidAllocator::allocate(
   if (skew)
     skew = alloc_unit - skew;
   *offset = p.get_start() + skew;
-  *length = MIN(MAX(alloc_unit, want_size), p.get_len() - skew);
-  if (g_conf->bluestore_debug_small_allocations) {
+  *length = std::min(std::max(alloc_unit, want_size), p2align((p.get_len() - skew), alloc_unit));
+  if (cct->_conf->bluestore_debug_small_allocations) {
     uint64_t max =
-      alloc_unit * (rand() % g_conf->bluestore_debug_small_allocations);
+      alloc_unit * (rand() % cct->_conf->bluestore_debug_small_allocations);
     if (max && *length > max) {
-      dout(10) << __func__ << " shortening allocation of " << *length << " -> "
-	       << max << " due to debug_small_allocations" << dendl;
+      ldout(cct, 10) << __func__ << " shortening allocation of 0x" << std::hex
+	       	     << *length << " -> 0x"
+	       	     << max << " due to debug_small_allocations" << std::dec
+		     << dendl;
       *length = max;
     }
   }
-  dout(30) << __func__ << " got " << *offset << "~" << *length << " from bin "
-	   << bin << dendl;
+  ldout(cct, 30) << __func__ << " got 0x" << std::hex << *offset << "~" << *length
+	   	 << " from bin " << std::dec << bin << dendl;
 
   free[bin].erase(*offset, *length);
   uint64_t off, len;
   if (*offset && free[bin].contains(*offset - skew - 1, &off, &len)) {
     int newbin = _choose_bin(len);
     if (newbin != bin) {
-      dout(30) << __func__ << " demoting " << off << "~" << len
-	       << " to bin " << newbin << dendl;
+      ldout(cct, 30) << __func__ << " demoting 0x" << std::hex << off << "~" << len
+	       	     << std::dec << " to bin " << newbin << dendl;
       free[bin].erase(off, len);
       _insert_free(off, len);
     }
@@ -187,121 +167,197 @@ int StupidAllocator::allocate(
   if (free[bin].contains(*offset + *length, &off, &len)) {
     int newbin = _choose_bin(len);
     if (newbin != bin) {
-      dout(30) << __func__ << " demoting " << off << "~" << len
-	       << " to bin " << newbin << dendl;
+      ldout(cct, 30) << __func__ << " demoting 0x" << std::hex << off << "~" << len
+	       	     << std::dec << " to bin " << newbin << dendl;
       free[bin].erase(off, len);
       _insert_free(off, len);
     }
   }
 
   num_free -= *length;
-  num_reserved -= *length;
-  assert(num_free >= 0);
-  assert(num_reserved >= 0);
+  ceph_assert(num_free >= 0);
   last_alloc = *offset + *length;
   return 0;
 }
 
-int StupidAllocator::release(
-  uint64_t offset, uint64_t length)
+int64_t StupidAllocator::allocate(
+  uint64_t want_size,
+  uint64_t alloc_unit,
+  uint64_t max_alloc_size,
+  int64_t hint,
+  PExtentVector *extents)
 {
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " " << offset << "~" << length << dendl;
-  uncommitted.insert(offset, length);
-  num_uncommitted += length;
-  return 0;
+  uint64_t allocated_size = 0;
+  uint64_t offset = 0;
+  uint32_t length = 0;
+  int res = 0;
+
+  if (max_alloc_size == 0) {
+    max_alloc_size = want_size;
+  }
+  // cap with 32-bit val
+  max_alloc_size = std::min(max_alloc_size, 0x10000000 - alloc_unit);
+
+  while (allocated_size < want_size) {
+    res = allocate_int(std::min(max_alloc_size, (want_size - allocated_size)),
+       alloc_unit, hint, &offset, &length);
+    if (res != 0) {
+      /*
+       * Allocation failed.
+       */
+      break;
+    }
+    bool can_append = true;
+    if (!extents->empty()) {
+      bluestore_pextent_t &last_extent  = extents->back();
+      if (last_extent.end() == offset) {
+        uint64_t l64 = last_extent.length;
+        l64 += length;
+        if (l64 < 0x100000000 && l64 <= max_alloc_size) {
+	  can_append = false;
+	  last_extent.length += length;
+        }
+      }
+    }
+    if (can_append) {
+      extents->emplace_back(bluestore_pextent_t(offset, length));
+    }
+
+    allocated_size += length;
+    hint = offset + length;
+  }
+
+  if (allocated_size == 0) {
+    return -ENOSPC;
+  }
+  return allocated_size;
+}
+
+void StupidAllocator::release(
+  const interval_set<uint64_t>& release_set)
+{
+  std::lock_guard l(lock);
+  for (interval_set<uint64_t>::const_iterator p = release_set.begin();
+       p != release_set.end();
+       ++p) {
+    const auto offset = p.get_start();
+    const auto length = p.get_len();
+    ldout(cct, 10) << __func__ << " 0x" << std::hex << offset << "~" << length
+		   << std::dec << dendl;
+    _insert_free(offset, length);
+    num_free += length;
+  }
 }
 
 uint64_t StupidAllocator::get_free()
 {
-  std::lock_guard<std::mutex> l(lock);
+  std::lock_guard l(lock);
   return num_free;
 }
 
-void StupidAllocator::dump(ostream& out)
+double StupidAllocator::get_fragmentation()
 {
-  std::lock_guard<std::mutex> l(lock);
+  ceph_assert(block_size);
+  double res;
+  uint64_t max_intervals = 0;
+  uint64_t intervals = 0;
+  {
+    std::lock_guard l(lock);
+    max_intervals = p2roundup<uint64_t>(num_free, block_size) / block_size;
+    for (unsigned bin = 0; bin < free.size(); ++bin) {
+      intervals += free[bin].num_intervals();
+    }
+  }
+  ldout(cct, 30) << __func__ << " " << intervals << "/" << max_intervals 
+                 << dendl;
+  ceph_assert(intervals <= max_intervals);
+  if (!intervals || max_intervals <= 1) {
+    return 0.0;
+  }
+  intervals--;
+  max_intervals--;
+  res = (double)intervals / max_intervals;
+  return res;
+}
+
+void StupidAllocator::dump()
+{
+  std::lock_guard l(lock);
   for (unsigned bin = 0; bin < free.size(); ++bin) {
-    dout(30) << __func__ << " free bin " << bin << ": "
-	     << free[bin].num_intervals() << " extents" << dendl;
+    ldout(cct, 0) << __func__ << " free bin " << bin << ": "
+	    	  << free[bin].num_intervals() << " extents" << dendl;
     for (auto p = free[bin].begin();
 	 p != free[bin].end();
 	 ++p) {
-      dout(30) << __func__ << "  " << p.get_start() << "~" << p.get_len() << dendl;
+      ldout(cct, 0) << __func__ << "  0x" << std::hex << p.get_start() << "~"
+	      	    << p.get_len() << std::dec << dendl;
     }
   }
-  dout(30) << __func__ << " committing: "
-	   << committing.num_intervals() << " extents" << dendl;
-  for (auto p = committing.begin();
-       p != committing.end();
-       ++p) {
-    dout(30) << __func__ << "  " << p.get_start() << "~" << p.get_len() << dendl;
-  }
-  dout(30) << __func__ << " uncommitted: "
-	   << uncommitted.num_intervals() << " extents" << dendl;
-  for (auto p = uncommitted.begin();
-       p != uncommitted.end();
-       ++p) {
-    dout(30) << __func__ << "  " << p.get_start() << "~" << p.get_len() << dendl;
+}
+
+void StupidAllocator::dump(std::function<void(uint64_t offset, uint64_t length)> notify)
+{
+  std::lock_guard l(lock);
+  for (unsigned bin = 0; bin < free.size(); ++bin) {
+    for (auto p = free[bin].begin(); p != free[bin].end(); ++p) {
+      notify(p.get_start(), p.get_len());
+    }
   }
 }
 
 void StupidAllocator::init_add_free(uint64_t offset, uint64_t length)
 {
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " " << offset << "~" << length << dendl;
+  std::lock_guard l(lock);
+  ldout(cct, 10) << __func__ << " 0x" << std::hex << offset << "~" << length
+		 << std::dec << dendl;
   _insert_free(offset, length);
   num_free += length;
 }
 
 void StupidAllocator::init_rm_free(uint64_t offset, uint64_t length)
 {
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " " << offset << "~" << length << dendl;
-  btree_interval_set<uint64_t> rm;
+  std::lock_guard l(lock);
+  ldout(cct, 10) << __func__ << " 0x" << std::hex << offset << "~" << length
+	   	 << std::dec << dendl;
+  interval_set_t rm;
   rm.insert(offset, length);
   for (unsigned i = 0; i < free.size() && !rm.empty(); ++i) {
-    btree_interval_set<uint64_t> overlap;
+    interval_set_t overlap;
     overlap.intersection_of(rm, free[i]);
     if (!overlap.empty()) {
-      dout(20) << __func__ << " bin " << i << " rm " << overlap << dendl;
-      free[i].subtract(overlap);
+      ldout(cct, 20) << __func__ << " bin " << i << " rm 0x" << std::hex << overlap
+		     << std::dec << dendl;
+      auto it = overlap.begin();
+      auto it_end = overlap.end();
+      while (it != it_end) {
+        auto o = it.get_start();
+        auto l = it.get_len();
+
+        free[i].erase(o, l,
+          [&](uint64_t off, uint64_t len) {
+            unsigned newbin = _choose_bin(len);
+            if (newbin != i) {
+              ldout(cct, 30) << __func__ << " demoting1 0x" << std::hex << off << "~" << len
+                             << std::dec << " to bin " << newbin << dendl;
+              _insert_free(off, len);
+              return true;
+            }
+            return false;
+          });
+        ++it;
+      }
+
       rm.subtract(overlap);
     }
   }
-  assert(rm.empty());
+  ceph_assert(rm.empty());
   num_free -= length;
-  assert(num_free >= 0);
+  ceph_assert(num_free >= 0);
 }
 
 
 void StupidAllocator::shutdown()
 {
-  dout(1) << __func__ << dendl;
+  ldout(cct, 1) << __func__ << dendl;
 }
 
-void StupidAllocator::commit_start()
-{
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " releasing " << num_uncommitted
-	   << " in extents " << uncommitted.num_intervals() << dendl;
-  assert(committing.empty());
-  committing.swap(uncommitted);
-  num_committing = num_uncommitted;
-  num_uncommitted = 0;
-}
-
-void StupidAllocator::commit_finish()
-{
-  std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " released " << num_committing
-	   << " in extents " << committing.num_intervals() << dendl;
-  for (auto p = committing.begin();
-       p != committing.end();
-       ++p) {
-    _insert_free(p.get_start(), p.get_len());
-  }
-  committing.clear();
-  num_free += num_committing;
-  num_committing = 0;
-}
